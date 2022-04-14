@@ -1,0 +1,2496 @@
+# list.of.packages <- c("RODBC", "DBI" ,"magrittr" ,"tidyverse" ,"zoo" ,"ggthemes" ,"lubridate" ,"readxl" ,"writexl" ,"openxlsx" ,"pdftools" ,"data.table" ,"broom")
+# new.packages <- list.of.packages[!(list.of.packages %in% installed.packages()[,"Package"])]
+# if(length(new.packages)) install.packages(new.packages)
+
+library(RODBC)
+library(DBI)
+library(magrittr)
+library(tidyverse)
+library(zoo)
+library(ggthemes)
+library(lubridate)
+library(readxl)
+library(writexl)
+library(openxlsx)
+library(naniar)
+library(simputation)
+library(pdftools)
+library(data.table)
+library(broom)
+library(stats)
+
+#####################################################################################
+## Calling this script that used to be in this one.
+## This script queries SNAP db and cleans it to create SubmissionsWithTriaInfo table
+#####################################################################################
+
+source("//newfs5/EXCEL/ACTUARIA/ACTUARIAL/SubmissionDataset/Code/getSubmissionsWithTriaInfo.R")
+
+
+#####################################################################################
+## OLF's --New Section
+#### First section not from the Alteryx process
+#####################################################################################
+
+## Bring in the data from SQL
+#### DC1RPTDBDEV01 table: rrr.Log_OnlevelFactors (look above for syntax)
+myconn <- odbcConnect("DC1RPTDBDEV01")
+
+RawOlfData <- sqlQuery(myconn , "
+declare @LatestDate datetime
+select @LatestDate = max(UploadDate) from ActuarialPlayPantry.rrr.Log_OnlevelFactors
+
+select *
+from ActuarialPlayPantry.rrr.Log_OnlevelFactors
+where uploadDate = @LatestDate
+")
+
+close(myconn)
+
+## Reset point
+OlfData <- as_tibble(RawOlfData) %>%
+  mutate_if(is.factor ,as.character)
+
+## Changing formatting
+OlfData <- OlfData %>%
+  mutate(PolicyMonth            = str_pad(PolicyMonth ,width = 2 ,side = "left" ,pad = "0")
+         ,PolicyYear            = as.character(PolicyYear)
+         ,State                 = as.character(State)
+         ,PolicyEffectiveDate   = as.Date(str_c(PolicyYear ,PolicyMonth ,"01" ,sep = "-"))
+         ,AccidentEffectiveDate = PolicyEffectiveDate + months(6)
+         ,AccidentYear          = year(AccidentEffectiveDate)
+         ,AccidentMonth         = str_pad(as.character(month(AccidentEffectiveDate)) ,width = 2 ,side = "left" ,pad = "0")
+  ) 
+
+#####################################################################################
+## LDF's & LER's --New Section
+
+#### Only pulling from the year-end ao files so this only changes yearly
+#####################################################################################
+
+ReservingYear <- ifelse(month(today()) * 100 + day(today()) > 125 ,year(today()) - 1 ,year(today()) - 2)
+ReservingYearFinalDigits <- str_extract(ReservingYear ,pattern = "[0-9]{2}$")
+
+BaseReservingPath <- str_c("//newfs5/EXCEL/LOSSDEV/" ,ReservingYear ,"/" ,ReservingYearFinalDigits ,"Yr_End/" ,ReservingYearFinalDigits ,"ICW_i")
+
+WcAoFileBoolean <- list.files(BaseReservingPath) %>%
+  str_detect(pattern = "^wcAO_[A-Z]{2}_[0-9]{6}_i_CD6//.xlsx$")
+
+ReserveTemplateNames <- list.files(BaseReservingPath)[WcAoFileBoolean]
+
+StateVector <- ReserveTemplateNames %>%
+  str_extract(pattern = "_[A-Z]{2}_") %>%
+  str_sub(start = 2 ,end = 3)
+
+ReserveTemplateLossAndAlaeLdfs <- NULL
+ReserveTemplateLers <- NULL
+
+## Should make a lot of components in this loop more dynamic
+#### like the slices, row that we're searching, etc...
+#### BT: Warning Message here: New Names. Research this later.
+for (i in 1:length(ReserveTemplateNames)) {
+  RawReserveData <- read_xlsx(file.path(BaseReservingPath ,ReserveTemplateNames)[i] ,sheet = "Data" ,col_names = FALSE)
+  RawLerData <- read_xlsx(file.path(BaseReservingPath ,ReserveTemplateNames)[i] ,sheet = "LERs" ,col_names = FALSE)
+  
+  AlaeLdfsColumn <- RawReserveData[11,] %>%
+    rowwise() %>%
+    str_detect(pattern = "Dev") %>%
+    which() %>%
+    min()
+  
+  ReserveTemplateAlaeLdfs <- RawReserveData[,c(2 ,AlaeLdfsColumn)] %>%
+    slice(14:28) %>%
+    mutate(LdfSource = ReserveTemplateNames[i]
+           ,State    = StateVector[i]) %>%
+    select(LdfSource ,State ,everything())
+  
+  colnames(ReserveTemplateAlaeLdfs) <- c("LdfSource" ,"State" ,"AccidentTrimester" ,"PaidAlaeCdf")
+  
+  ReserveTemplateAlaeLdfs <- ReserveTemplateAlaeLdfs %>%
+    mutate(PaidAlaeCdf = as.numeric(PaidAlaeCdf))
+  
+  MedOnlyLdfsColumn <- RawReserveData[8,] %>%
+    rowwise() %>%
+    str_detect(pattern = "Med Only") %>%
+    which() %>%
+    min()
+  
+  ReserveTemplateMedOnlyLdfs <- RawReserveData[,c(2 ,MedOnlyLdfsColumn)] %>%
+    slice(14:28) %>%
+    mutate(LdfSource = ReserveTemplateNames[i]
+           ,State    = StateVector[i]) %>%
+    select(LdfSource ,State ,everything())
+  
+  colnames(ReserveTemplateMedOnlyLdfs) <- c("LdfSource" ,"State" ,"AccidentTrimester" ,"IncurredMedOnlyCdf")
+  
+  ReserveTemplateMedOnlyLdfs <- ReserveTemplateMedOnlyLdfs %>%
+    mutate(IncurredMedOnlyCdf = as.numeric(IncurredMedOnlyCdf))  
+  
+  LossLdfColumns <- RawReserveData[34,] %>%
+    rowwise() %>%
+    str_detect(pattern = "A-to-U") %>%
+    which() + 1
+  
+  ReserveTemplateLossLdfs <- RawReserveData[,c(1:2 ,LossLdfColumns)] %>%
+    slice(39:98) %>%
+    mutate(LdfSource = ReserveTemplateNames[i]
+           ,State    = StateVector[i]) %>%
+    select(LdfSource ,State ,everything()) 
+  
+  colnames(ReserveTemplateLossLdfs) <- c("LdfSource" ,"State" ,"AccidentTrimester" ,"AccidentDate" ,"IncurredLossCdf" ,"PaidLossCdf")
+  
+  ReserveTemplateLossLdfs <- ReserveTemplateLossLdfs %>%
+    mutate(AccidentDate     = as.Date(as.numeric(AccidentDate) ,origin = "1899-12-30")
+           ,AccidentYear    = year(AccidentDate)
+           ,AccidentMonth   = str_pad(month(AccidentDate) ,width = 2 ,side = "left" ,pad = "0")
+           ,IncurredLossCdf = as.numeric(IncurredLossCdf)
+           ,PaidLossCdf     = as.numeric(PaidLossCdf)) %>%
+    select(LdfSource:AccidentTrimester ,AccidentYear:AccidentMonth ,everything() ,-AccidentDate)
+  
+  RowCount <- count(ReserveTemplateLossLdfs) %>%
+    pull()
+  
+  AgeVector <- seq(from = RowCount ,to = 1 ,by = -1)
+  
+  ReserveTemplateLossLdfs <- ReserveTemplateLossLdfs %>%
+    mutate(Age = AgeVector) %>%
+    select(LdfSource:State ,Age ,everything())
+  
+  LossAndAlaeLdfs <- ReserveTemplateLossLdfs %>%
+    left_join(ReserveTemplateAlaeLdfs ,by = c("LdfSource" ,"State" ,"AccidentTrimester")) %>%
+    left_join(ReserveTemplateMedOnlyLdfs ,by = c("LdfSource" ,"State" ,"AccidentTrimester"))
+  
+  ReserveTemplateLossAndAlaeLdfs <- bind_rows(ReserveTemplateLossAndAlaeLdfs ,LossAndAlaeLdfs)
+  
+  TemperingRow <- RawReserveData[,3] %>%
+    pull() %>%
+    str_detect(pattern = "Tempering Factor") %>%
+    which()
+  
+  MillionLimitColumn <- RawReserveData[TemperingRow-1,] %>%
+    str_detect(pattern = "^[0-9]{7}$") %>%
+    which()
+  
+  TwoHundredThousandColumn <- RawReserveData[TemperingRow-1,] %>%
+    str_detect(pattern = "^[0-9]{6}$") %>%
+    which()  
+  
+  TemperingFactors <- RawReserveData[c(TemperingRow-1 ,TemperingRow) ,c(pmin(MillionLimitColumn[1] ,TwoHundredThousandColumn[1]) ,pmax(MillionLimitColumn[1] ,TwoHundredThousandColumn[1]))] %>%
+    t() %>%
+    as.data.frame() %>%
+    as_tibble()
+  
+  colnames(TemperingFactors) <- c("LossLimit" ,"LerTemperingFactor") 
+  
+  TemperingFactors <- TemperingFactors %>%
+    mutate(LerSource           = ReserveTemplateNames[i]
+           ,State              = StateVector[i]
+           ,LossLimit          = as.numeric(as.character(LossLimit))
+           ,LerTemperingFactor = as.numeric(as.character(LerTemperingFactor))) %>%
+    select(LerSource:State ,everything())
+  
+  LerRows <- RawLerData[1] %>%
+    pull() %>%
+    str_detect(pattern = "^200000$|^1000000$") %>%
+    which()
+  
+  LerLastColumn <- RawLerData[4,] %>%
+    str_detect(pattern = "Total") %>%
+    which() - 1
+  
+  LerData <- RawLerData[LerRows ,c(1:LerLastColumn)] %>%
+    mutate_if(is_character ,as.numeric) %>%
+    mutate(LerSource = ReserveTemplateNames[i]
+           ,State    = StateVector[i]) %>%
+    select(LerSource ,State ,everything())
+  
+  colnames(LerData) <- c("LerSource" ,"State" ,"LossLimit" ,as.character(c(1:7)))
+  
+  LerData <- LerData %>%
+    gather(key = "HazardGroup" ,value = "Ler" ,`1`:`7`) %>%
+    arrange(LossLimit ,HazardGroup)
+  
+  LerData <- LerData %>%
+    left_join(TemperingFactors ,by = c("LerSource" ,"State" ,"LossLimit")) %>%
+    mutate(TemperedLer = Ler * LerTemperingFactor
+           ,HazardGroup = as.numeric(HazardGroup)) %>%
+    select(LerSource:HazardGroup ,LerTemperingFactor ,Ler ,TemperedLer)
+  
+  ReserveTemplateLers <- bind_rows(ReserveTemplateLers ,LerData)
+  
+}
+
+ReserveTemplate200kLers <- ReserveTemplateLers %>%
+  filter(LossLimit == 200000) %>%
+  rename(LerTemperingFactor200k = LerTemperingFactor
+         ,Ler200k               = Ler
+         ,TemperedLer200k       = TemperedLer) %>%
+  select(-LossLimit)
+
+ReserveTemplate1mLers <- ReserveTemplateLers %>%
+  filter(LossLimit == 1000000) %>%
+  rename(LerTemperingFactor1m = LerTemperingFactor
+         ,Ler1m               = Ler
+         ,TemperedLer1m       = TemperedLer) %>%
+  select(-LossLimit)
+
+ReserveTemplateLers <- ReserveTemplate200kLers %>%
+  left_join(ReserveTemplate1mLers ,by = c("LerSource" ,"State" ,"HazardGroup"))
+
+AverageLers <- ReserveTemplateLers %>%
+  filter(State != "CA") %>%
+  group_by(HazardGroup) %>%
+  summarise(HazardGroupTemperedLer200k = mean(TemperedLer200k)
+            ,HazardGroupTemperedLer1m  = mean(TemperedLer1m)) 
+
+AvgTemperedLer200k <- AverageLers$HazardGroupTemperedLer200k
+AvgTemperedLer1m <- AverageLers$HazardGroupTemperedLer1m
+
+ReserveTemplateLossAndAlaeLdfs <- ReserveTemplateLossAndAlaeLdfs %>%
+  mutate(IncurredLossPercentRptd     = 1 / IncurredLossCdf
+         ,PaidLossPercentRptd        = 1 / PaidLossCdf
+         ,PaidAlaePercentRptd        = 1 / PaidAlaeCdf
+         ,IncurredMedOnlyPercentRptd = 1 / IncurredMedOnlyCdf
+  )
+
+InterpolatedReserveTemplateLossLdfs <- ReserveTemplateLossAndAlaeLdfs %>%
+  arrange(State ,Age) %>%
+  group_by(State) %>%
+  mutate(Age                                     = Age - .5
+         ,LowerIncurredLossPercentRptd           = coalesce(lag(IncurredLossPercentRptd) ,IncurredLossPercentRptd)
+         ,LowerPaidLossPercentRptd               = coalesce(lag(PaidLossPercentRptd) ,PaidLossPercentRptd)
+         ,LowerPaidAlaePercentRptd               = coalesce(lag(PaidAlaePercentRptd ,n = 4) ,PaidAlaePercentRptd)
+         ,LowerIncurredMedOnlyPercentRptd        = coalesce(lag(IncurredMedOnlyPercentRptd ,n = 4) ,IncurredMedOnlyPercentRptd)
+         ,InterpolatedIncurredLossPercentRptd    = (IncurredLossPercentRptd + LowerIncurredLossPercentRptd) / 2
+         ,InterpolatedPaidLossPercentRptd        = (PaidLossPercentRptd + LowerPaidLossPercentRptd) / 2
+         ,InterpolatedPaidAlaePercentRptd        = ifelse(mod(Age ,4)==0 ,PaidAlaePercentRptd ,(PaidAlaePercentRptd * (mod(Age ,4) / 4)) + (LowerPaidAlaePercentRptd * (1 - mod(Age ,4) / 4)))
+         ,InterpolatedIncurredMedOnlyPercentRptd = ifelse(mod(Age ,4)==0 ,IncurredMedOnlyPercentRptd ,(IncurredMedOnlyPercentRptd * (mod(Age ,4) / 4)) + (LowerIncurredMedOnlyPercentRptd * (1 - mod(Age ,4) / 4)))
+         ,InterpolatedIncurredLossCdf            = 1 / InterpolatedIncurredLossPercentRptd
+         ,InterpolatedPaidLossCdf                = 1 / InterpolatedPaidLossPercentRptd
+         ,InterpolatedPaidAlaeCdf                = 1 / InterpolatedPaidAlaePercentRptd
+         ,InterpolatedIncurredMedOnlyCdf         = 1 / InterpolatedIncurredMedOnlyPercentRptd         
+  ) %>%
+  select(LdfSource ,State ,Age ,AccidentTrimester:AccidentMonth ,InterpolatedIncurredLossCdf:InterpolatedIncurredMedOnlyCdf ,InterpolatedIncurredLossPercentRptd:InterpolatedIncurredMedOnlyPercentRptd)
+
+InterpolatedReserveTemplateAlaeLdfs <- ReserveTemplateLossAndAlaeLdfs %>%
+  arrange(State ,Age) %>%
+  group_by(State) %>%
+  mutate(LowerPaidAlaePercentRptd                = coalesce(lag(PaidAlaePercentRptd ,n = 4) ,PaidAlaePercentRptd)
+         ,LowerIncurredMedOnlyPercentRptd        = coalesce(lag(IncurredMedOnlyPercentRptd ,n = 4) ,IncurredMedOnlyPercentRptd)
+         ,InterpolatedPaidAlaePercentRptd        = ifelse(mod(Age ,4)==0 ,PaidAlaePercentRptd ,(PaidAlaePercentRptd * (mod(Age ,4) / 4)) + (LowerPaidAlaePercentRptd * (1 - mod(Age ,4) / 4)))
+         ,InterpolatedIncurredMedOnlyPercentRptd = ifelse(mod(Age ,4)==0 ,IncurredMedOnlyPercentRptd ,(IncurredMedOnlyPercentRptd * (mod(Age ,4) / 4)) + (LowerIncurredMedOnlyPercentRptd * (1 - mod(Age ,4) / 4)))
+         ,InterpolatedPaidAlaeCdf                = 1 / InterpolatedPaidAlaePercentRptd
+         ,InterpolatedIncurredMedOnlyCdf         = 1 / InterpolatedIncurredMedOnlyPercentRptd
+  ) %>%
+  select(LdfSource:AccidentMonth ,InterpolatedPaidAlaeCdf ,InterpolatedIncurredMedOnlyCdf ,InterpolatedPaidAlaePercentRptd ,InterpolatedIncurredMedOnlyPercentRptd)
+
+InterpolatedReserveTemplateLossAndAlaeLdfs <- ReserveTemplateLossAndAlaeLdfs %>%
+  select(LdfSource:AccidentMonth ,IncurredLossCdf ,PaidLossCdf ,IncurredLossPercentRptd ,PaidLossPercentRptd) %>%
+  rename(InterpolatedIncurredLossCdf         = IncurredLossCdf
+         ,InterpolatedPaidLossCdf             = PaidLossCdf
+         ,InterpolatedIncurredLossPercentRptd = IncurredLossPercentRptd
+         ,InterpolatedPaidLossPercentRptd     = PaidLossPercentRptd
+  ) %>%
+  bind_rows(. ,InterpolatedReserveTemplateLossLdfs) %>%
+  arrange(State ,Age) %>%
+  left_join(InterpolatedReserveTemplateAlaeLdfs ,by = c("LdfSource" ,"State" ,"Age" ,"AccidentTrimester" ,"AccidentYear" ,"AccidentMonth")) %>%
+  mutate(InterpolatedPaidAlaeCdf                 = coalesce(InterpolatedPaidAlaeCdf.x ,InterpolatedPaidAlaeCdf.y)
+         ,InterpolatedIncurredMedOnlyCdf         = coalesce(InterpolatedIncurredMedOnlyCdf.x ,InterpolatedIncurredMedOnlyCdf.y)
+         ,InterpolatedPaidAlaePercentRptd        = coalesce(InterpolatedPaidAlaePercentRptd.x ,InterpolatedPaidAlaePercentRptd.y)
+         ,InterpolatedIncurredMedOnlyPercentRptd = coalesce(InterpolatedIncurredMedOnlyPercentRptd.x ,InterpolatedIncurredMedOnlyPercentRptd.y)
+  ) %>%
+  select(-contains(".x") ,-contains(".y")) %>%
+  select(LdfSource:InterpolatedPaidLossCdf ,InterpolatedPaidAlaeCdf ,InterpolatedIncurredMedOnlyCdf ,InterpolatedIncurredLossPercentRptd:InterpolatedPaidLossPercentRptd ,InterpolatedPaidAlaePercentRptd ,InterpolatedIncurredMedOnlyPercentRptd) %>%
+  mutate(InterpolatedPaidAlaeCdf                 = ifelse(Age < 4 ,(1 / (log((Age / 4) * (exp(InterpolatedPaidAlaePercentRptd) - 1) + 1))) ,InterpolatedPaidAlaeCdf)
+         ,InterpolatedIncurredMedOnlyCdf         = ifelse(Age < 4 ,(1 / (log((Age / 4) * (exp(InterpolatedIncurredMedOnlyPercentRptd) - 1) + 1))) ,InterpolatedIncurredMedOnlyCdf)
+         ,InterpolatedPaidAlaePercentRptd        = ifelse(Age < 4 ,1 / InterpolatedPaidAlaeCdf ,InterpolatedPaidAlaePercentRptd)
+         ,InterpolatedIncurredMedOnlyPercentRptd = ifelse(Age < 4 ,1 / InterpolatedIncurredMedOnlyCdf ,InterpolatedIncurredMedOnlyPercentRptd))
+
+InterpolatedReservingLossLdfs <- InterpolatedReserveTemplateLossAndAlaeLdfs %>%
+  select(State ,Age ,InterpolatedIncurredLossCdf:InterpolatedPaidLossCdf ,InterpolatedIncurredLossPercentRptd:InterpolatedPaidLossPercentRptd)
+
+InterpolatedReservingAlaeLdfs <- InterpolatedReserveTemplateLossAndAlaeLdfs %>%
+  select(State ,Age ,InterpolatedPaidAlaeCdf:InterpolatedIncurredMedOnlyCdf ,InterpolatedPaidAlaePercentRptd:InterpolatedIncurredMedOnlyPercentRptd) 
+
+LossTailFactorsByState <- InterpolatedReservingLossLdfs %>%
+  filter(Age == 60) %>%
+  select(-Age)
+
+AlaeTailFactorsByState <- InterpolatedReservingAlaeLdfs %>%
+  filter(Age == 60) %>%
+  select(-Age)
+
+StateVector <- InterpolatedReservingLossLdfs %>%
+  select(State) %>%
+  unique() %>%
+  pull()
+
+AdditionalAges <- seq(from = 60.5 ,to = 72 ,by = .5)
+
+StateVectorRepeated <- sort(rep(StateVector ,length(AdditionalAges)))
+
+TailAges <- tibble(
+  State = StateVectorRepeated
+  ,Age  = rep(AdditionalAges ,length(StateVector))
+)
+
+LossTailReservingLdfs <- TailAges %>%
+  left_join(LossTailFactorsByState ,by = "State")
+
+AlaeTailReservingLdfs <- TailAges %>%
+  left_join(AlaeTailFactorsByState ,by = "State")
+
+InterpolatedReservingLossLdfs <- InterpolatedReservingLossLdfs %>%
+  bind_rows(LossTailReservingLdfs) %>%
+  arrange(State ,Age)
+
+InterpolatedReservingAlaeLdfs <- InterpolatedReservingAlaeLdfs %>%
+  bind_rows(AlaeTailReservingLdfs) %>%
+  arrange(State ,Age)
+
+AverageInterpolatedLossLdfs <- InterpolatedReservingLossLdfs %>%
+  filter(State != "CA") %>%
+  group_by(Age) %>%
+  summarise(AvgInterpolatedIncurredLossCdf          = mean(InterpolatedIncurredLossCdf) 
+            ,AvgInterpolatedPaidLossCdf             = mean(InterpolatedPaidLossCdf)
+            ,AvgInterpolatedIncurredLossPercentRptd = 1 / AvgInterpolatedIncurredLossCdf
+            ,AvgInterpolatedPaidLossPercentRptd     = 1 / AvgInterpolatedPaidLossCdf
+  )
+
+AverageInterpolatedAlaeLdfs <- InterpolatedReservingAlaeLdfs %>%
+  filter(State != "CA") %>%
+  group_by(Age) %>%
+  summarise(AvgInterpolatedPaidAlaeCdf                 = mean(InterpolatedPaidAlaeCdf)
+            ,AvgInterpolatedIncurredMedOnlyCdf         = mean(InterpolatedIncurredMedOnlyCdf)
+            ,AvgInterpolatedPaidAlaePercentRptd        = 1 / AvgInterpolatedPaidAlaeCdf
+            ,AvgInterpolatedIncurredMedOnlyPercentRptd = 1 / AvgInterpolatedIncurredMedOnlyCdf
+)
+
+#####################################################################################
+## Claim Data --New Section
+#####################################################################################
+
+myconn <- odbcConnect("CODSDMBIDBPRD")
+
+RawCodsInfo <- sqlQuery(myconn ,"
+--Server: CODSDMBIDBPRD
+--Database: CODS_DataMart
+                        
+set nocount on
+set ansi_warnings off
+
+declare @asof date = convert(date ,dateadd(dd ,-1*day(getdate())+1 ,getdate()))
+declare @MinPolicyYear int = Year(getdate()) - 6
+
+select 
+ PolicyNumber              = cs.MstPolicyNo
+ ,cs.ClaimNumber
+ ,Loss_Dt                  = convert(date ,concat(left(convert(varchar ,cs.dimLossDate_Key) ,4) ,'-' ,substring(convert(varchar ,cs.dimLossDate_Key) ,5 ,2) ,'-' ,right(convert(varchar ,cs.dimLossDate_Key) ,2)))
+ ,AccidentYear             = left(convert(varchar ,cs.dimLossDate_Key) ,4)
+ ,AccidentMonth            = substring(convert(varchar ,cs.dimLossDate_Key) ,5 ,2)
+ ,JurisdictionState        = cl.JurisdictionCode
+ ,OpenClaim                = case when dclmt.ClaimStatusDesc <> 'Closed' then 1 else 0 end
+ ,ClosedClaim              = case when dclmt.ClaimStatusDesc = 'Closed' then 1 else 0 end
+ ,IndemnityClaim           = case when Inc_Medical + Inc_Indemnity + Inc_VocRehab >= 2500 then 1 else 0 end
+ ,MedOnlyClaim             = case when Inc_Medical + Inc_Indemnity + Inc_VocRehab < 2500 then 1 else 0 end
+ ,LitigatedClaim           = dclmt.Litigated
+ ,Final_Medical_Paid       = Paid_Medical
+ ,Final_Indemnity_Paid     = Paid_Indemnity
+ ,Final_Rehab_Paid         = Paid_VocRehab
+ ,Final_ALAE_Paid          = Paid_Expense
+ ,TotalPaidLoss            = Paid_Medical + Paid_Indemnity + Paid_VocRehab
+ ,TotalPaidLossAndAlae     = Paid_Medical + Paid_Indemnity + Paid_VocRehab + Paid_Expense
+ ,Final_Medical_Reserve    = Res_Medical
+ ,Final_Indemnity_Reserve  = Res_Indemnity
+ ,Final_Rehab_Reserve      = Res_VocRehab
+ ,Final_ALAE_Reserve       = Res_Expense
+ ,TotalLossReserve         = Res_Medical + Res_Indemnity + Res_VocRehab
+ ,TotalLossAndAlaeReserve  = Res_Medical + Res_Indemnity + Res_VocRehab + Res_Expense
+ ,Final_Medical_Incurred   = Inc_Medical
+ ,Final_Indemnity_Incurred = Inc_Indemnity
+ ,Final_Rehab_Incurred     = Inc_VocRehab
+ ,Final_ALAE_Incurred      = Inc_Expense
+ ,TotalIncurredLoss        = Inc_Medical + Inc_Indemnity + Inc_VocRehab
+ ,TotalIncurredLossAndAlae = Inc_Medical + Inc_Indemnity + Inc_VocRehab + Inc_Expense
+ ,dclmt.ClaimStatusDesc
+ ,dclmt.FraudDesc
+from CODS_DataMart.dbo.fctClaimSummary         cs
+   inner join CODS_DataMart.dbo.dimClaim       cl on cs.ClaimNumber = cl.ClaimNumber	and cl.ETLExpirationDt > @asof and cl.ETLEffectiveDt <= @asof	
+   inner join CODS_DataMart.dbo.dimPolicy      dp on cs.MstPolicyNo = dp.MstPolicyNo and cs.ETLExpirationDt > @asof and cs.ETLEffectiveDt <= @asof and 
+                                                        dp.ETLExpirationDt > @asof and dp.ETLEffectiveDt <= @asof	
+   inner join CODS_DataMart.dbo.dimClaimant dclmt on cs.claimantID = dclmt.claimantID and dclmt.ETLExpirationDt > @asof and dclmt.ETLEffectiveDt <= @asof
+where cs.ETLEffectiveDt <= @asof
+  and cs.ETLExpirationDt > @asof
+  and year(dp.poleffdate+1) >= @MinPolicyYear
+  and (cl.[Voided Claim] is null or cl.[Voided Claim] = '' or cl.[Voided Claim]=0)   
+")
+
+close(myconn)
+
+RawCodsInfo <- as_tibble(RawCodsInfo)
+
+ClaimsWithOnlvl <- RawCodsInfo %>%
+  mutate(AccidentMonth = str_pad(AccidentMonth ,width = 2 ,side = "left" ,pad = "0")) %>%
+  mutate_if(is.factor ,as.character) %>%
+  left_join(OlfData ,by = c("AccidentYear" ,"AccidentMonth" ,"JurisdictionState" = "State"))
+
+CapAmount <- 200000
+AlaeCapAmount <- 1000000
+EvaluationDate <- floor_date(today() ,unit = "months") - days(1)
+
+ClaimsWithCapped <- ClaimsWithOnlvl %>% 
+  mutate(MedOnlyPaidLoss                   = ifelse(MedOnlyClaim == 1 ,TotalPaidLoss ,0)
+         ,MedOnlyPaidLossAndAlae           = ifelse(MedOnlyClaim == 1 ,TotalPaidLossAndAlae ,0)
+         ,MedOnlyIncurredLoss              = ifelse(MedOnlyClaim == 1 ,TotalIncurredLoss ,0)
+         ,MedOnlyIncurredLossAndAlae       = ifelse(MedOnlyClaim == 1 ,TotalIncurredLossAndAlae ,0)
+         ,IndemnityPaidLoss                = ifelse(IndemnityClaim == 1 ,TotalPaidLoss ,0)
+         ,IndemnityPaidLossAndAlae         = ifelse(IndemnityClaim == 1 ,TotalPaidLossAndAlae ,0)
+         ,IndemnityIncurredLoss            = ifelse(IndemnityClaim == 1 ,TotalIncurredLoss ,0)
+         ,IndemnityIncurredLossAndAlae     = ifelse(IndemnityClaim == 1 ,TotalIncurredLossAndAlae ,0)
+         ,LossTrendFactor                  = coalesce(CombinedBenefitAndSawwTrend, 1) * coalesce(PurePremiumResidualTrend, 1)
+         ,IncurredLossAndAlaeXs1M          = pmax(TotalIncurredLossAndAlae - AlaeCapAmount ,0)
+         ,OnlvlMedOnlyIncurredLoss         = MedOnlyIncurredLoss
+         ,OnlvlPaidAlae                    = Final_ALAE_Paid * LossTrendFactor
+         ,OnlvlIndemnityPaidLoss           = IndemnityPaidLoss * LossTrendFactor
+         ,OnlvlPaidLossAndAlae             = TotalPaidLossAndAlae * LossTrendFactor
+         ,OnlvlIndemnityIncurredLoss       = IndemnityIncurredLoss * LossTrendFactor
+         ,OnlvlIncurredLossAndAlae         = TotalIncurredLossAndAlae * LossTrendFactor
+         ,OnlvlIncurredLossAndAlaeXs1M     = pmax(OnlvlIncurredLossAndAlae - AlaeCapAmount ,0)
+         ,CappedMedOnlyIncurredLoss        = pmin(MedOnlyIncurredLoss ,CapAmount)
+         ,CappedPaidAlae                   = ifelse(TotalIncurredLossAndAlae==0 ,Final_ALAE_Paid ,Final_ALAE_Paid - (IncurredLossAndAlaeXs1M * (Final_ALAE_Paid / TotalIncurredLossAndAlae)))
+         ,CappedIndemnityPaidLoss          = pmin(IndemnityPaidLoss ,CapAmount)  
+         ,CappedPaidLossAndAlae            = pmin(TotalPaidLossAndAlae ,CapAmount)
+         ,CappedIndemnityIncurredLoss      = pmin(IndemnityIncurredLoss ,CapAmount)
+         ,CappedIncurredLossAndAlae        = pmin(TotalIncurredLossAndAlae ,CapAmount)
+         ,CappedOnlvlMedOnlyIncurredLoss   = pmin(OnlvlMedOnlyIncurredLoss ,CapAmount)
+         ,CappedOnlvlPaidAlae              = ifelse(OnlvlIncurredLossAndAlae==0 ,OnlvlPaidAlae ,OnlvlPaidAlae - (OnlvlIncurredLossAndAlaeXs1M * (OnlvlPaidAlae / OnlvlIncurredLossAndAlae)))
+         ,CappedOnlvlIndemnityPaidLoss     = pmin(OnlvlIndemnityPaidLoss ,CapAmount)
+         ,CappedOnlvlPaidLossAndAlae       = pmin(OnlvlPaidLossAndAlae ,CapAmount)
+         ,CappedOnlvlIndemnityIncurredLoss = pmin(OnlvlIndemnityIncurredLoss ,CapAmount)
+         ,CappedOnlvlIncurredLossAndAlae   = pmin(OnlvlIncurredLossAndAlae ,CapAmount)
+         ,PolicyNumber                     = str_replace_all(toupper(PolicyNumber) ,pattern = "-" ,replacement = " ")
+         ,ClaimEvaluationDate              = EvaluationDate
+  ) %>%
+  select(ClaimEvaluationDate ,PolicyNumber ,everything())
+
+PolicyLevelClaims <- ClaimsWithCapped %>%
+  group_by(ClaimEvaluationDate ,PolicyNumber) %>%
+  summarise(IndemnityClaimCount               = sum(IndemnityClaim)
+            ,MedOnlyClaimCount                = sum(MedOnlyClaim)
+            ,TotalClaimCount                  = n()
+            ,PaidIndemnity                    = sum(Final_Indemnity_Paid)
+            ,PaidMedical                      = sum(Final_Medical_Paid)
+            # ,PaidOther                        = sum(Final_Other_Paid)
+            # ,PaidEmployerLiability            = sum(Final_Empl_Liab_Paid)
+            ,PaidRehab                        = sum(Final_Rehab_Paid)
+            ,PaidAlae                         = sum(Final_ALAE_Paid)
+            ,TotalPaidLoss                    = sum(TotalPaidLoss)
+            ,TotalPaidLossAndAlae             = sum(TotalPaidLossAndAlae)
+            ,ReserveIndemnity                 = sum(Final_Indemnity_Reserve)
+            ,ReserveMedical                   = sum(Final_Medical_Reserve)
+            # ,ReserveOther                     = sum(Final_Other_Reserve)
+            # ,ReserveEmployerLiability         = sum(Final_Empl_Liab_Reserve)
+            ,ReserveRehab                     = sum(Final_Rehab_Reserve)
+            ,ReserveAlae                      = sum(Final_ALAE_Reserve)
+            ,TotalLossReserve                 = sum(TotalLossReserve)
+            ,TotalLossAndAlaeReserve          = sum(TotalLossAndAlaeReserve)
+            ,IncurredIndemnity                = sum(Final_Indemnity_Incurred)
+            ,IncurredMedical                  = sum(Final_Medical_Incurred)
+            # ,IncurredOther                    = sum(Final_Other_Incurred)
+            # ,IncurredEmployerLiability        = sum(Final_Empl_Liab_Incurred)
+            ,IncurredRehab                    = sum(Final_Rehab_Incurred)
+            ,IncurredAlae                     = sum(Final_ALAE_Incurred)
+            ,TotalIncurredLoss                = sum(TotalIncurredLoss)
+            ,TotalIncurredLossAndAlae         = sum(TotalIncurredLossAndAlae)
+            ,MedOnlyPaidLoss                  = sum(MedOnlyPaidLoss)
+            ,MedOnlyPaidLossAndAlae           = sum(MedOnlyPaidLossAndAlae)
+            ,MedOnlyIncurredLoss              = sum(MedOnlyIncurredLoss)
+            ,MedOnlyIncurredLossAndAlae       = sum(MedOnlyIncurredLossAndAlae)
+            ,IndemnityPaidLoss                = sum(IndemnityPaidLoss)
+            ,IndemnityPaidLossAndAlae         = sum(IndemnityPaidLossAndAlae)
+            ,IndemnityIncurredLoss            = sum(IndemnityIncurredLoss)
+            ,IndemnityIncurredLossAndAlae     = sum(IndemnityIncurredLossAndAlae)
+            ,OnlvlMedOnlyIncurredLoss         = sum(OnlvlMedOnlyIncurredLoss)
+            ,OnlvlPaidAlae                    = sum(OnlvlPaidAlae)
+            ,OnlvlIndemnityPaidLoss           = sum(OnlvlIndemnityPaidLoss)
+            ,OnlvlPaidLossAndAlae             = sum(OnlvlPaidLossAndAlae)
+            ,OnlvlIndemnityIncurredLoss       = sum(OnlvlIndemnityIncurredLoss)
+            ,OnlvlIncurredLossAndAlae         = sum(OnlvlIncurredLossAndAlae)
+            ,CappedMedOnlyIncurredLoss        = sum(CappedMedOnlyIncurredLoss)
+            ,CappedPaidAlae                   = sum(CappedPaidAlae)
+            ,CappedIndemnityPaidLoss          = sum(CappedIndemnityPaidLoss)
+            ,CappedPaidLossAndAlae            = sum(CappedPaidLossAndAlae)
+            ,CappedIndemnityIncurredLoss      = sum(CappedIndemnityIncurredLoss)
+            ,CappedIncurredLossAndAlae        = sum(CappedIncurredLossAndAlae)
+            ,CappedOnlvlMedOnlyIncurredLoss   = sum(CappedOnlvlMedOnlyIncurredLoss)
+            ,CappedOnlvlPaidAlae              = sum(CappedOnlvlPaidAlae)
+            ,CappedOnlvlIndemnityPaidLoss     = sum(CappedOnlvlIndemnityPaidLoss)
+            ,CappedOnlvlPaidLossAndAlae       = sum(CappedOnlvlPaidLossAndAlae)
+            ,CappedOnlvlIndemnityIncurredLoss = sum(CappedOnlvlIndemnityIncurredLoss)
+            ,CappedOnlvlIncurredLossAndAlae   = sum(CappedOnlvlIncurredLossAndAlae)
+  )
+
+## Removing unneccessary datasets to increase performance
+rm(list=setdiff(ls(), c("FinalAlteryxData" ,"SubmissionsWithTriaInfo" ,"PolicyLevelClaims" ,"InterpolatedReservingLossLdfs" ,"InterpolatedReservingAlaeLdfs" ,"AverageInterpolatedLossLdfs" ,"AverageInterpolatedAlaeLdfs" ,"SnapFieldsFinal" ,"FinalXldpWarehouseData" ,"OlfData" ,"ReserveTemplateLers" ,"AverageLers" ,"EvaluationDate" ,"CombinedDataset" ,"InforceDateRange" ,"AvgTemperedLer200k" ,"AvgTemperedLer1m" ,"ClassCodeLookups")))
+
+#####################################################################################
+## SNAP Variables --New Section
+#####################################################################################
+
+#invisible(gc())
+#invisible(memory.limit(80000))
+
+SnapSubmissionFilterTable <- SubmissionsWithTriaInfo %>%
+  select(Quote_ID ,proposal_number) %>%
+  mutate_all(as.integer) %>%
+  filter(Quote_ID != 0)
+
+SnapMonthlyQuery <- "
+set nocount on
+set ansi_warnings off
+
+Select 
+ T02.submission_number               as SubmissionNumber
+ ,cast(T02.effective_date+1 as date) as EffectiveDate
+ ,cast(T02.expiration_date as date)  as ExpirationDate
+ ,T02.current_node_name              as 'status'
+ ,T06.agency_number
+ ,T07.name as InsuredName
+ ,coalesce(T01.ordinal_number ,0)    as ProposalNumber
+ ,T01.total_premium                  as QuotedPremium
+ ,T03.name                           as SNAPSheetName
+ ,T04.name                           as DataColumnFullName
+ ,T04.value                          as DataValue 	
+From SNAP_WC.dbo.submission           T02
+   Left Join SNAP_WC.dbo.quote        T01 on T01.submission_id = T02.id
+   Left Join SNAP_WC.dbo.person       P   on T02.responsible_underwriter_id = P.id
+   Left Join SNAP_WC.dbo.organization O   on T02.carrier_branch_id = O.id
+   Left Join SNAP_WC.dbo.form         T03 on T01.form_set_ID = T03.Owner_ID
+   Left Join SNAP_WC.dbo.form_field   T04 on T03.Id = T04.Form_ID
+   Left Join SNAP_WC.dbo.uiform_field T05 on T04.field_template_id = T05.field_template_id
+   left join SNAP_WC.dbo.agency       T06 on T06.id = T02.agency_id
+   Left Join SNAP_WC.dbo.insured      T07 on T02.insured_id = T07.id
+  inner join ##tmp_tbl                T08 on T02.submission_number = T08.Quote_ID and coalesce(T01.ordinal_number ,0) = T08.proposal_number
+Order by T02.effective_date, T02.submission_number, T01.ordinal_number ,T03.name 
+"
+SnapMonthlyQuery <- str_replace_all(SnapMonthlyQuery ,pattern = "//s|//t" ,replacement = " ")
+
+myconn <- odbcConnect("BI_SNAP_WC")
+secondconn <- dbConnect(odbc::odbc(),
+                    driver = "SQL Server",
+                    database = "tempdb",
+                    server = "snapbidbprd.icwgrp.com")
+
+dbCreateTable(secondconn ,"##tmp_tbl" ,SnapSubmissionFilterTable ,temporary = TRUE)
+dbWriteTable(secondconn ,"##tmp_tbl" ,SnapSubmissionFilterTable ,append = TRUE)
+
+RawSnapFieldsMonthly <- sqlQuery(myconn ,SnapMonthlyQuery)
+
+close(myconn)
+dbDisconnect(secondconn)
+
+RawSnapFieldsMonthly <- as_tibble(RawSnapFieldsMonthly) %>%
+  mutate_if(is.factor ,as.character) %>%
+  mutate(Variable = str_c(SNAPSheetName ,"_" ,DataColumnFullName ,"_monthly")) %>%
+  filter(!is.na(Variable))
+
+MonthlyDistinctSubmissions <- n_distinct(RawSnapFieldsMonthly$SubmissionNumber)
+
+AdditionalFieldPatternsToKeep <- c("selectedCompany|modeledCompany|rateMode|tier|Tier|cTR")
+
+MonthlySnapVariablesToKeepVector <- RawSnapFieldsMonthly %>%
+  group_by(Variable) %>%
+  summarise(PercentAvailable = n() / MonthlyDistinctSubmissions) %>%
+  arrange(desc(PercentAvailable)) %>%
+  filter(PercentAvailable > .5 | str_detect(Variable ,pattern = AdditionalFieldPatternsToKeep)) %>%
+  select(Variable) %>%
+  pull()
+  
+RawSnapFieldsMonthly <- RawSnapFieldsMonthly %>%
+  filter(Variable %in% MonthlySnapVariablesToKeepVector)
+
+SnapFieldsSpreadMonthly <- RawSnapFieldsMonthly %>%
+  select(SubmissionNumber ,ProposalNumber ,Variable ,DataValue) %>%
+  spread(key = Variable ,value = DataValue) 
+
+rm(RawSnapFieldsMonthly)
+
+SnapDailyQuery <- "
+set nocount on
+set ansi_warnings off
+
+Select 
+ T02.submission_number               as SubmissionNumber
+ ,cast(T02.effective_date+1 as date) as EffectiveDate
+ ,cast(T02.expiration_date as date)  as ExpirationDate
+ ,T02.current_node_name              as 'status'
+ ,T06.agency_number
+ ,T07.name as InsuredName
+ ,coalesce(T01.ordinal_number ,0)    as ProposalNumber
+ ,T01.total_premium                  as QuotedPremium
+ ,T03.name                           as SNAPSheetName
+ ,T04.name                           as DataColumnFullName
+ ,T04.value                          as DataValue 	
+From SNAP_WC_Daily.dbo.submission           T02
+   Left Join SNAP_WC_Daily.dbo.quote        T01 on T01.submission_id = T02.id
+   Left Join SNAP_WC_Daily.dbo.person       P   on T02.responsible_underwriter_id = P.id
+   Left Join SNAP_WC_Daily.dbo.organization O   on T02.carrier_branch_id = O.id
+   Left Join SNAP_WC_Daily.dbo.form         T03 on T01.form_set_ID = T03.Owner_ID
+   Left Join SNAP_WC_Daily.dbo.form_field   T04 on T03.Id = T04.Form_ID
+   Left Join SNAP_WC_Daily.dbo.uiform_field T05 on T04.field_template_id = T05.field_template_id
+   left join SNAP_WC_Daily.dbo.agency       T06 on T06.id = T02.agency_id
+   Left Join SNAP_WC_Daily.dbo.insured      T07 on T02.insured_id = T07.id
+  inner join ##tmp_tbl                      T08 on T02.submission_number = T08.Quote_ID and coalesce(T01.ordinal_number ,0) = T08.proposal_number
+Order by T02.effective_date, T02.submission_number, T01.ordinal_number ,T03.name 
+"
+SnapDailyQuery <- str_replace_all(SnapDailyQuery ,pattern = "//s|//t" ,replacement = " ")
+
+myconn <- odbcConnect("BI_SNAP_WC_Daily")
+secondconn <- dbConnect(odbc::odbc(),
+                        driver = "SQL Server",
+                        database = "tempdb",
+                        server = "snapbidbprd.icwgrp.com")
+
+dbCreateTable(secondconn ,"##tmp_tbl" ,SnapSubmissionFilterTable ,temporary = TRUE)
+dbWriteTable(secondconn ,"##tmp_tbl" ,SnapSubmissionFilterTable ,append = TRUE)
+
+RawSnapFieldsDaily <- sqlQuery(myconn ,SnapDailyQuery)
+
+close(myconn)
+
+RawSnapFieldsDaily <- as_tibble(RawSnapFieldsDaily) %>%
+  mutate_if(is.factor ,as.character) %>%
+  mutate(Variable = str_c(SNAPSheetName ,"_" ,DataColumnFullName ,"_daily")) %>%
+  filter(!is.na(Variable))
+
+DailyDistinctSubmissions <- n_distinct(RawSnapFieldsDaily$SubmissionNumber)
+
+DailySnapVariablesToKeepVector <- RawSnapFieldsDaily %>%
+  group_by(Variable) %>%
+  summarise(PercentAvailable = n() / DailyDistinctSubmissions) %>%
+  arrange(desc(PercentAvailable)) %>%
+  filter(PercentAvailable > .5 | str_detect(Variable ,pattern = AdditionalFieldPatternsToKeep)) %>%
+  select(Variable) %>%
+  pull()
+
+RawSnapFieldsDaily <- RawSnapFieldsDaily %>%
+  filter(Variable %in% DailySnapVariablesToKeepVector)
+
+SnapFieldsSpreadDaily <- RawSnapFieldsDaily %>%
+  select(SubmissionNumber ,ProposalNumber ,Variable ,DataValue) %>%
+  spread(key = Variable ,value = DataValue)
+
+rm(RawSnapFieldsDaily)
+
+SnapFields <- full_join(SnapFieldsSpreadDaily ,SnapFieldsSpreadMonthly ,by = c("SubmissionNumber" ,"ProposalNumber")) 
+
+SnapDailyColumns <- str_remove(colnames(SnapFieldsSpreadDaily) ,pattern = "_daily")
+SnapMonthlyColumns <- str_remove(colnames(SnapFieldsSpreadMonthly) ,pattern = "_monthly")
+BothDailyAndMonthlyColumns <- intersect(SnapDailyColumns ,SnapMonthlyColumns)
+BothDailyAndMonthlyColumns <- BothDailyAndMonthlyColumns[!BothDailyAndMonthlyColumns %in% c("SubmissionNumber" ,"ProposalNumber")]
+OnlyDailyColumns <- setdiff(SnapDailyColumns ,SnapMonthlyColumns)
+OnlyMonthlyColumns <- setdiff(SnapMonthlyColumns ,SnapDailyColumns)
+
+SnapFieldsFinal <- SnapFields %>%
+  mutate_if(is.factor ,as.character)
+
+if (length(BothDailyAndMonthlyColumns) > 0) {
+  for (i in 1:length(BothDailyAndMonthlyColumns)) {
+    SnapFieldsFinal <- SnapFieldsFinal %>%
+      mutate(!!BothDailyAndMonthlyColumns[i] := coalesce(!!sym(str_c(BothDailyAndMonthlyColumns[i] ,"_daily")) ,!!sym(str_c(BothDailyAndMonthlyColumns[i] ,"_monthly")))) %>%
+      select(-c(!!sym(str_c(BothDailyAndMonthlyColumns[i] ,"_daily")) ,!!sym(str_c(BothDailyAndMonthlyColumns[i] ,"_monthly"))))
+  }
+}
+
+if (length(OnlyDailyColumns) > 0) {
+  for (i in 1:length(OnlyDailyColumns)) {
+    SnapFieldsFinal <- SnapFieldsFinal %>%
+      rename(!!OnlyDailyColumns[i] := !!sym(str_c(OnlyDailyColumns[i] ,"_daily")))
+  }
+}
+
+if (length(OnlyMonthlyColumns) > 0) {
+  for (i in 1:length(OnlyMonthlyColumns)) {
+    SnapFieldsFinal <- SnapFieldsFinal %>%
+      rename(!!OnlyMonthlyColumns[i] := !!sym(str_c(OnlyMonthlyColumns[i] ,"_monthly")))
+  }
+}
+
+## Removing unneccessary datasets to increase performance
+rm(list=setdiff(ls(), c("FinalAlteryxData" ,"SubmissionsWithTriaInfo" ,"PolicyLevelClaims" ,"InterpolatedReservingLossLdfs" ,"InterpolatedReservingAlaeLdfs" ,"AverageInterpolatedLossLdfs" ,"AverageInterpolatedAlaeLdfs" ,"SnapFieldsFinal" ,"FinalXldpWarehouseData" ,"OlfData" ,"ReserveTemplateLers" ,"AverageLers" ,"EvaluationDate" ,"CombinedDataset" ,"InforceDateRange" ,"AvgTemperedLer200k" ,"AvgTemperedLer1m" ,"ClassCodeLookups")))
+
+#####################################################################################
+## XLDP Data --New Section
+#####################################################################################
+
+myconn <- odbcConnect("BI_XLDP")
+
+RawXldpApplication <- sqlQuery(myconn , "
+with LatestWarehouse as (
+     select MaxWarehouseId = max(a.WarehouseId)
+     from XLDPWarehouse.dbo.dimApplication  a
+        left join XLDPWarehouse.dbo.dimDate d on a.ProspectivePolicyEffectiveDateDimId = d.ObjectId
+     where d.CalendarDate >= Concat(Year(GetDate()) - 6, '-01-01') 
+       and a.AccountId is not null
+       and a.ProposalNumber is not null 
+     group by
+      a.AccountId
+      ,a.ProposalNumber
+)
+
+select
+ a.* 
+ ,b.SubmissionTypeName 
+ ,c.ProducerName
+ ,EffectiveDate              = d.CalendarDate
+ ,ExpirationDate             = e.CalendarDate
+ ,f.PayPlanTypeName
+ ,g.PayPlanFrequencyName
+ ,h.CheckAuditsFrequencyName
+ ,ParticipatingPlanSelection = i.ParticipatingPlanName
+ ,ParticipatingPlanType      = j.ParticipatingPlanName
+ ,SecondaryParPlanSelection  = k.ParticipatingPlanName
+ ,SecondaryParPlanType       = l.ParticipatingPlanName
+ ,m.PolicyStatusName
+from XLDPWarehouse.dbo.dimApplication                  a
+   left join XLDPWarehouse.dbo.dimSubmissionType       b on a.SubmissionTypeDimId = b.ObjectId   
+   left join XLDPWarehouse.dbo.dimProducer             c on a.ProducerDimId = c.ObjectId
+   left join XLDPWarehouse.dbo.dimDate                 d on a.ProspectivePolicyEffectiveDateDimId = d.ObjectId
+   left join XLDPWarehouse.dbo.dimDate                 e on a.ProspectivePolicyExpirationDateDimId = e.ObjectId
+   left join XLDPWarehouse.dbo.dimPayPlanType          f on a.PayPlanTypeDimId = f.ObjectId
+   left join XLDPWarehouse.dbo.dimPayPlanFrequency     g on a.PayPlanFrequencyDimId = g.ObjectId
+   left join XLDPWarehouse.dbo.dimCheckAuditsFrequency h on a.CheckAuditsFrequencyDimId = h.ObjectId
+   left join XLDPWarehouse.dbo.dimParticipatingPlan    i on a.ParticipatingPlanSelectionDimId = i.ObjectId
+   left join XLDPWarehouse.dbo.dimParticipatingPlan    j on a.ParticipatingPlanTypeDimId = j.ObjectId
+   left join XLDPWarehouse.dbo.dimParticipatingPlan    k on a.SecondaryParPlanSelectionDimId = k.ObjectId
+   left join XLDPWarehouse.dbo.dimParticipatingPlan    l on a.SecondaryParPlanTypeDimId = l.ObjectId
+   left join XLDPWarehouse.dbo.dimPolicyStatus         m on a.PolicyStatusDimId = m.ObjectId
+  inner join LatestWarehouse                           o on a.WarehouseId = o.MaxWarehouseId
+")
+
+RawGeoExperienceModifier <- sqlQuery(myconn ,"
+with LatestWarehouse as (
+     select MaxWarehouseId = max(a.WarehouseId)
+     from XLDPWarehouse.dbo.dimApplication  a
+        left join XLDPWarehouse.dbo.dimDate d on a.ProspectivePolicyEffectiveDateDimId = d.ObjectId
+     where d.CalendarDate >= Concat(Year(GetDate()) - 6, '-01-01') 
+       and a.AccountId is not null
+       and a.ProposalNumber is not null 
+     group by
+      a.AccountId
+      ,a.ProposalNumber
+)
+
+select 
+ a.*
+ ,StateOrBureau = case when b.StateOrBureauName = 'National Council on Compensation Insurance, Inc.'
+                       then 'NcciPublishedXmod'
+                       else concat(replace(b.StateOrBureauName ,' ' ,'') ,'PublishedXmodYesNo')
+                       end
+from XLDPWarehouse.dbo.fctApplicationGeoExperienceModifier a
+   left join XLDPWarehouse.dbo.dimStateOrBureau            b on a.StateOrBureauDimId = b.ObjectId
+  inner join LatestWarehouse                               c on a.ApplicationDimId = c.MaxWarehouseId
+")
+
+RawGeoExperienceModifierByPolicyPeriod <- sqlQuery(myconn ,"
+with LatestWarehouse as (
+     select MaxWarehouseId = max(a.WarehouseId)
+     from XLDPWarehouse.dbo.dimApplication  a
+        left join XLDPWarehouse.dbo.dimDate d on a.ProspectivePolicyEffectiveDateDimId = d.ObjectId
+     where d.CalendarDate >= Concat(Year(GetDate()) - 6, '-01-01') 
+       and a.AccountId is not null
+       and a.ProposalNumber is not null 
+     group by
+      a.AccountId
+      ,a.ProposalNumber
+)
+
+select 
+ a.*
+ ,c.PolicyPeriodName
+ ,StateOrBureauWithPolicyPeriod = case when b.StateOrBureauName = 'National Council on Compensation Insurance, Inc.'
+                                       then concat(replace(c.PolicyPeriodName ,'_' ,'') ,'NcciXmod')
+					                             else concat(replace(c.PolicyPeriodName ,'_' ,'') ,replace(b.StateOrBureauName ,' ' ,'') ,'Xmod')
+					                             end 
+from XLDPWarehouse.dbo.fctApplicationGeoExperienceModifierByPolicyPeriod a
+   left join XLDPWarehouse.dbo.dimStateOrBureau                          b on a.StateOrBureauDimId = b.ObjectId
+   left join XLDPWarehouse.dbo.dimPolicyPeriod                           c on a.PolicyPeriodDimId = c.ObjectId
+  inner join LatestWarehouse                                             d on a.ApplicationDimId = d.MaxWarehouseId
+
+")
+
+RawGeoProfile <- sqlQuery(myconn ,"
+with LatestWarehouse as (
+     select MaxWarehouseId = max(a.WarehouseId)
+     from XLDPWarehouse.dbo.dimApplication  a
+        left join XLDPWarehouse.dbo.dimDate d on a.ProspectivePolicyEffectiveDateDimId = d.ObjectId
+     where d.CalendarDate >= Concat(Year(GetDate()) - 6, '-01-01') 
+       and a.AccountId is not null
+       and a.ProposalNumber is not null 
+     group by
+      a.AccountId
+      ,a.ProposalNumber
+)
+
+select
+ a.*
+ ,StateProvinceName   = replace(b.StateProvinceName ,' ' ,'')
+ ,c.IncreasedLimitsCd
+from XLDPWarehouse.dbo.fctApplicationGeoProfile   a
+   left join XLDPWarehouse.dbo.dimStateProvince   b on a.StateProvinceDimId = b.ObjectId
+   left join XLDPWarehouse.dbo.dimIncreasedLimits c on a.IncreasedLimitsDimId = c.ObjectId
+  inner join LatestWarehouse                      d on a.ApplicationDimId = d.MaxWarehouseId
+where StateProvinceDimId <> 1
+  and (ScheduleCreditDebitAmountPercentage is not null
+   or SubjectPremiumAmt is not null
+   or TotalPayrollAmt is not null
+   or IncreasedLimitsPremiumAmt is not null
+   or ExpenseConstantAmt is not null
+   or ScheduleRatingCTRFactor is not null)                          
+")
+
+RawGeoTier <- sqlQuery(myconn ,"
+with LatestWarehouse as (
+     select MaxWarehouseId = max(a.WarehouseId)
+     from XLDPWarehouse.dbo.dimApplication  a
+        left join XLDPWarehouse.dbo.dimDate d on a.ProspectivePolicyEffectiveDateDimId = d.ObjectId
+     where d.CalendarDate >= Concat(Year(GetDate()) - 6, '-01-01') 
+       and a.AccountId is not null
+       and a.ProposalNumber is not null 
+     group by
+      a.AccountId
+      ,a.ProposalNumber
+)
+
+select
+ a.*
+ ,StateProvinceName = replace(b.StateProvinceName ,' ' ,'')
+ ,RatingTier        = replace(c.RatingTierName ,' ' ,'')
+ ,SelectedTier      = replace(d.RatingTierName ,' ' ,'')
+from XLDPWarehouse.dbo.fctApplicationGeoTier      a
+   left join XLDPWarehouse.dbo.dimStateProvince   b on a.StateProvinceDimId = b.ObjectId
+   left join XLDPWarehouse.dbo.dimRatingTier      c on a.RatingTierDimId = c.ObjectId
+   left join XLDPWarehouse.dbo.dimRatingTier      d on a.SelectedTierDimId = d.ObjectId
+  inner join LatestWarehouse                      e on a.ApplicationDimId = e.MaxWarehouseId
+")
+
+RawLocation <- sqlQuery(myconn ,"
+with LatestWarehouse as (
+     select MaxWarehouseId = max(a.WarehouseId)
+     from XLDPWarehouse.dbo.dimApplication  a
+        left join XLDPWarehouse.dbo.dimDate d on a.ProspectivePolicyEffectiveDateDimId = d.ObjectId
+     where d.CalendarDate >= Concat(Year(GetDate()) - 6, '-01-01') 
+       and a.AccountId is not null
+       and a.ProposalNumber is not null 
+     group by
+      a.AccountId
+      ,a.ProposalNumber
+)
+
+select
+ a.*
+ ,b.CountyName
+ ,c.StateProvinceName
+ ,StateCounty         = concat(replace(c.StateProvinceName ,' ' ,'') ,replace(replace(b.CountyName ,' ' ,'') ,'-' ,''))
+from XLDPWarehouse.dbo.fctApplicationLocation   a
+   left join XLDPWarehouse.dbo.dimCounty        b on a.CountyDimId = b.ObjectId
+   left join XLDPWarehouse.dbo.dimStateProvince c on b.StateProvinceDimId = c.ObjectId
+  inner join LatestWarehouse                    e on a.ApplicationDimId = e.MaxWarehouseId
+")
+
+RawMiscCredit <- sqlQuery(myconn ,"
+with LatestWarehouse as (
+     select MaxWarehouseId = max(a.WarehouseId)
+     from XLDPWarehouse.dbo.dimApplication  a
+        left join XLDPWarehouse.dbo.dimDate d on a.ProspectivePolicyEffectiveDateDimId = d.ObjectId
+     where d.CalendarDate >= Concat(Year(GetDate()) - 6, '-01-01') 
+       and a.AccountId is not null
+       and a.ProposalNumber is not null 
+     group by
+      a.AccountId
+      ,a.ProposalNumber
+)
+
+select
+ a.*
+ ,YearsWithIcwGrouped  = replace(b.YearsWithICWName ,' ' ,'')
+ ,LossControlRiskLevel = replace(c.LossControlRiskLevelName ,' ' ,'')
+from XLDPWarehouse.dbo.fctApplicationMiscCredit        a
+   left join XLDPWarehouse.dbo.dimYearsWithICW         b on a.YearsWithICWDimId = b.ObjectId
+   left join XLDPWarehouse.dbo.dimLossControlRiskLevel c on a.LossControlRiskLevelDimId = c.ObjectId
+  inner join LatestWarehouse                           e on a.ApplicationDimId = e.MaxWarehouseId
+")
+
+RawMiscCreditByState <- sqlQuery(myconn ,"
+with LatestWarehouse as (
+     select MaxWarehouseId = max(a.WarehouseId)
+     from XLDPWarehouse.dbo.dimApplication  a
+        left join XLDPWarehouse.dbo.dimDate d on a.ProspectivePolicyEffectiveDateDimId = d.ObjectId
+     where d.CalendarDate >= Concat(Year(GetDate()) - 6, '-01-01') 
+       and a.AccountId is not null
+       and a.ProposalNumber is not null 
+     group by
+      a.AccountId
+      ,a.ProposalNumber
+)
+
+select
+ a.*
+ ,b.StateProvinceName
+ ,c.MedicalProviderNetworkTypeName
+ ,StateMpnType = concat(replace(b.StateProvinceName ,' ' ,'') ,replace(replace(replace(replace(replace(c.MedicalProviderNetworkTypeName ,' ' ,'') ,'MedicalProviderNetworkType' ,'') ,'(noMPNPlan)' ,'') ,'(CaliforniaMPNPlan)' ,'') ,'/MPN(HealthCareOrganizationastheMPN)' ,''))
+from XLDPWarehouse.dbo.fctApplicationMiscCreditByState       a
+   left join XLDPWarehouse.dbo.dimStateProvince              b on a.StateProvinceDimId = b.ObjectId
+   left join XLDPWarehouse.dbo.dimMedicalProviderNetworkType c on a.MedicalProviderNetworkTypeDimId = c.ObjectId
+  inner join LatestWarehouse                                 e on a.ApplicationDimId = e.MaxWarehouseId
+where StateProvinceDimId <> 1
+  and (SafetyCreditYesNoNA is not null
+   or DrugFreeCreditYesNoNA is not null
+   or ContractorsCreditPercentage is not null
+   or MeritRatingPercentage is not null
+   or SmallEmployerIncentivePercentage is not null
+   or MiscCredit1Percentage is not null
+   or SIMNSAElectedYN is not null
+   or HealthCareNetworkCreditYesNoNA is not null
+   or WCPremiumReductionYesNoNA is not null
+   )                                 
+")
+
+RawPayroll <- sqlQuery(myconn ,"
+with LatestWarehouse as (
+     select MaxWarehouseId = max(a.WarehouseId)
+     from XLDPWarehouse.dbo.dimApplication  a
+        left join XLDPWarehouse.dbo.dimDate d on a.ProspectivePolicyEffectiveDateDimId = d.ObjectId
+     where d.CalendarDate >= Concat(Year(GetDate()) - 6, '-01-01') 
+       and a.AccountId is not null
+       and a.ProposalNumber is not null 
+     group by
+      a.AccountId
+      ,a.ProposalNumber
+)
+
+select
+ a.*
+ ,PolicyClass = b.ClassName
+ ,c.StateProvinceName
+ ,PolicyStateClass          = case when c.StateProvinceCd <> left(b.ClassName ,2) 
+                                   then (case when b.ClassSuffix <> 'NA' then concat(c.StateProvinceCd ,'.' ,b.ClassName ,'.' ,b.ClassSuffix) else concat(c.StateProvinceCd ,'.' ,b.ClassName) end)
+                                   else b.ClassName 
+                                   end
+from XLDPWarehouse.dbo.fctApplicationPayroll    a
+   left join XLDPWarehouse.dbo.dimClass         b on a.ClassDimId = b.ObjectId
+   left join XLDPWarehouse.dbo.dimStateProvince c on b.StateProvinceDimId = c.ObjectId
+  inner join LatestWarehouse                    e on a.ApplicationDimId = e.MaxWarehouseId
+")
+
+RawXldpModel <- sqlQuery(myconn ,"
+with LatestWarehouse as (
+     select MaxWarehouseId = max(a.WarehouseId)
+     from XLDPWarehouse.dbo.dimApplication  a
+        left join XLDPWarehouse.dbo.dimDate d on a.ProspectivePolicyEffectiveDateDimId = d.ObjectId
+     where d.CalendarDate >= Concat(Year(GetDate()) - 6, '-01-01') 
+       and a.AccountId is not null
+       and a.ProposalNumber is not null 
+     group by
+      a.AccountId
+      ,a.ProposalNumber
+)
+
+select
+ a.*
+ ,GoverningClass           = concat(c.StateProvinceCd ,'.' ,b.ClassCd)
+ ,GoverningClassWithSuffix = case when b.ClassSuffix = 'NA' 
+                                  then concat(c.StateProvinceCd ,'.' ,b.ClassCd) 
+						          else concat(c.StateProvinceCd ,'.' ,b.ClassCd ,'.' ,b.ClassSuffix) 
+						          end
+ ,BestParPlan              = replace(replace(d.ParticipatingPlanName ,' ' ,'') ,'ParticipatingPlan' ,'')
+ ,SelectedParPlan          = replace(replace(e.ParticipatingPlanName ,' ' ,'') ,'ParticipatingPlan' ,'')
+ ,SelectedSecondaryParPlan = replace(replace(f.ParticipatingPlanName ,' ' ,'') ,'ParticipatingPlan' ,'')
+ ,InstantQuoteRatingType   = replace(replace(replace(g.InstantQuoteRatingTypeName ,' ' ,'') ,'InstantQuoteRatingType' ,'') ,'Ftr' ,'')
+from XLDPWarehouse.dbo.fctXLDPModel                      a
+   left join XLDPWarehouse.dbo.dimClass                  b on a.GoverningClassDimId = b.ObjectId
+   left join XLDPWarehouse.dbo.dimStateProvince          c on b.StateProvinceDimId = c.ObjectId
+   left join XLDPWarehouse.dbo.dimParticipatingPlan      d on a.BestParPlanDimId = d.ObjectId
+   left join XLDPWarehouse.dbo.dimParticipatingPlan      e on a.SelectedParPlanDimId = e.ObjectId
+   left join XLDPWarehouse.dbo.dimParticipatingPlan      f on a.SelectedParPlanDimId = f.ObjectId
+   left join XLDPWarehouse.dbo.dimInstantQuoteRatingType g on a.InstantQuoteRatingTypeDimId = g.ObjectId
+  inner join LatestWarehouse                             h on a.ApplicationDimId = h.MaxWarehouseId
+")
+
+RawClassFitAdjustment <- sqlQuery(myconn ,"
+with LatestWarehouse as (
+     select MaxWarehouseId = max(a.WarehouseId)
+     from XLDPWarehouse.dbo.dimApplication  a
+        left join XLDPWarehouse.dbo.dimDate d on a.ProspectivePolicyEffectiveDateDimId = d.ObjectId
+     where d.CalendarDate >= Concat(Year(GetDate()) - 6, '-01-01') 
+       and a.AccountId is not null
+       and a.ProposalNumber is not null 
+     group by
+      a.AccountId
+      ,a.ProposalNumber
+)
+
+select
+ a.*
+ ,ClassFitAdjustmentCategory = replace(replace(b.ClassFitAdjustmentCategoryName ,' ' ,'') ,'ClassAdjustmentCategory' ,'')
+from XLDPWarehouse.dbo.fctXLDPModelClassFitAdjustment        a
+   left join XLDPWarehouse.dbo.dimClassFitAdjustmentCategory b on a.ClassFitAdjustmentCategoryDimId = b.ObjectId
+  inner join LatestWarehouse                                 c on a.ApplicationDimId = c.MaxWarehouseId
+")
+
+RawClassFitScoring <- sqlQuery(myconn ,"
+with LatestWarehouse as (
+     select MaxWarehouseId = max(a.WarehouseId)
+     from XLDPWarehouse.dbo.dimApplication  a
+        left join XLDPWarehouse.dbo.dimDate d on a.ProspectivePolicyEffectiveDateDimId = d.ObjectId
+     where d.CalendarDate >= Concat(Year(GetDate()) - 6, '-01-01') 
+       and a.AccountId is not null
+       and a.ProposalNumber is not null 
+     group by
+      a.AccountId
+      ,a.ProposalNumber
+)
+
+select
+ a.*
+ ,ClassFitGroup     = replace(replace(b.ClassFitGroupName ,' ' ,'') ,'ClassFitGroup' ,'')
+ ,ClassFitCategory  = replace(replace(c.ClassFitCategoryName ,' ' ,'') ,'ClassCategory' ,'')
+ ,ClassFitScoreType = replace(replace(d.ClassFitScoreTypeName ,' ' ,'') ,'ClassFitScoreType' ,'')
+ ,ClassFitGroup_Category_ScoreType = concat(replace(replace(b.ClassFitGroupName ,' ' ,'') ,'ClassFitGroup' ,'') ,replace(replace(c.ClassFitCategoryName ,' ' ,'') ,'ClassCategory' ,'') ,replace(replace(d.ClassFitScoreTypeName ,' ' ,'') ,'ClassFitScoreType' ,''))
+from XLDPWarehouse.dbo.fctXLDPModelClassFitScoring  a
+   left join XLDPWarehouse.dbo.dimClassFitGroup     b on a.ClassFitGroupDimId = b.ObjectId
+   left join XLDPWarehouse.dbo.dimClassFitCategory  c on a.ClassFitCategoryDimId = c.ObjectId
+   left join XLDPWarehouse.dbo.dimClassFitScoreType d on a.ClassFitScoreTypeDimId = d.ObjectId
+  inner join LatestWarehouse                        e on a.ApplicationDimId = e.MaxWarehouseId
+where ClassFitCategoryDimId <> 12
+  and ClassFitScoreTypeDimId not in(11,12)
+")
+
+RawClassFitScoring2 <- sqlQuery(myconn ,"
+with LatestWarehouse as (
+     select MaxWarehouseId = max(a.WarehouseId)
+     from XLDPWarehouse.dbo.dimApplication  a
+        left join XLDPWarehouse.dbo.dimDate d on a.ProspectivePolicyEffectiveDateDimId = d.ObjectId
+     where d.CalendarDate >= Concat(Year(GetDate()) - 6, '-01-01') 
+       and a.AccountId is not null
+       and a.ProposalNumber is not null 
+     group by
+      a.AccountId
+      ,a.ProposalNumber
+)
+
+select
+ a.*
+ ,ClassFitGroup     = replace(replace(b.ClassFitGroupName ,' ' ,'') ,'ClassFitGroup' ,'')
+ ,ClassFitCategory  = replace(replace(c.ClassFitCategoryName ,' ' ,'') ,'ClassCategory' ,'')
+ ,ClassFitScoreType = replace(replace(d.ClassFitScoreTypeName ,' ' ,'') ,'ClassFitScoreType' ,'')
+ ,ClassFitGroup_Category_ScoreType = concat(replace(replace(b.ClassFitGroupName ,' ' ,'') ,'ClassFitGroup' ,'') ,'_' ,replace(replace(c.ClassFitCategoryName ,' ' ,'') ,'ClassCategory' ,'') ,'_' ,replace(replace(d.ClassFitScoreTypeName ,' ' ,'') ,'ClassFitScoreType' ,''))
+from XLDPWarehouse.dbo.fctXLDPModelClassFitScoring  a
+   left join XLDPWarehouse.dbo.dimClassFitGroup     b on a.ClassFitGroupDimId = b.ObjectId
+   left join XLDPWarehouse.dbo.dimClassFitCategory  c on a.ClassFitCategoryDimId = c.ObjectId
+   left join XLDPWarehouse.dbo.dimClassFitScoreType d on a.ClassFitScoreTypeDimId = d.ObjectId
+  inner join LatestWarehouse                        e on a.ApplicationDimId = e.MaxWarehouseId
+where ClassFitCategoryDimId = 12
+  and ClassFitScore is not null
+  and ClassFitScoreTypeDimId not in(11,12)
+")
+
+RawClassFitScoring3 <- sqlQuery(myconn ,"
+with LatestWarehouse as (
+     select MaxWarehouseId = max(a.WarehouseId)
+     from XLDPWarehouse.dbo.dimApplication  a
+        left join XLDPWarehouse.dbo.dimDate d on a.ProspectivePolicyEffectiveDateDimId = d.ObjectId
+     where d.CalendarDate >= Concat(Year(GetDate()) - 6, '-01-01') 
+       and a.AccountId is not null
+       and a.ProposalNumber is not null 
+     group by
+      a.AccountId
+      ,a.ProposalNumber
+)
+
+select
+ a.*
+ ,ClassFitGroup     = replace(replace(b.ClassFitGroupName ,' ' ,'') ,'ClassFitGroup' ,'')
+ ,ClassFitCategory  = replace(replace(c.ClassFitCategoryName ,' ' ,'') ,'ClassCategory' ,'')
+ ,ClassFitScoreType = replace(replace(d.ClassFitScoreTypeName ,' ' ,'') ,'ClassFitScoreType' ,'')
+ ,ClassFitGroup_Category_ScoreType = concat(replace(replace(b.ClassFitGroupName ,' ' ,'') ,'ClassFitGroup' ,'') ,'_' ,replace(replace(c.ClassFitCategoryName ,' ' ,'') ,'ClassCategory' ,'') ,'_' ,replace(replace(d.ClassFitScoreTypeName ,' ' ,'') ,'ClassFitScoreType' ,''))
+from XLDPWarehouse.dbo.fctXLDPModelClassFitScoring  a
+   left join XLDPWarehouse.dbo.dimClassFitGroup     b on a.ClassFitGroupDimId = b.ObjectId
+   left join XLDPWarehouse.dbo.dimClassFitCategory  c on a.ClassFitCategoryDimId = c.ObjectId
+   left join XLDPWarehouse.dbo.dimClassFitScoreType d on a.ClassFitScoreTypeDimId = d.ObjectId
+  inner join LatestWarehouse                        e on a.ApplicationDimId = e.MaxWarehouseId
+where ClassFitCategoryDimId = 12
+  and ClassFitValuePercentage is not null   
+  and ClassFitScoreTypeDimId not in(11,12)
+")
+
+RawExpenseGroup <- sqlQuery(myconn ,"
+with LatestWarehouse as (
+     select MaxWarehouseId = max(a.WarehouseId)
+     from XLDPWarehouse.dbo.dimApplication  a
+        left join XLDPWarehouse.dbo.dimDate d on a.ProspectivePolicyEffectiveDateDimId = d.ObjectId
+     where d.CalendarDate >= Concat(Year(GetDate()) - 6, '-01-01') 
+       and a.AccountId is not null
+       and a.ProposalNumber is not null 
+     group by
+      a.AccountId
+      ,a.ProposalNumber
+)
+
+select
+ a.*
+ ,ExpenseTypeName = replace(replace(b.ExpenseTypeName ,' ' ,'') ,'ExpenseType' ,'')
+from XLDPWarehouse.dbo.fctXLDPModelExpenseGroup a
+   left join XLDPWarehouse.dbo.dimExpenseType   b on a.ExpenseTypeDimId = b.ObjectId
+  inner join LatestWarehouse                    c on a.ApplicationDimId = c.MaxWarehouseId
+")
+
+RawWtdExperienceModifier <- sqlQuery(myconn ,"
+with LatestWarehouse as (
+     select MaxWarehouseId = max(a.WarehouseId)
+     from XLDPWarehouse.dbo.dimApplication  a
+        left join XLDPWarehouse.dbo.dimDate d on a.ProspectivePolicyEffectiveDateDimId = d.ObjectId
+     where d.CalendarDate >= Concat(Year(GetDate()) - 6, '-01-01') 
+       and a.AccountId is not null
+       and a.ProposalNumber is not null 
+     group by
+      a.AccountId
+      ,a.ProposalNumber
+)
+
+select
+ a.*
+ ,PolicyPeriod = replace(replace(b.PolicyPeriodName ,' ' ,'') ,'PolicyPeriod' ,'')
+from XLDPWarehouse.dbo.fctXLDPModelExperienceModifier a
+   left join XLDPWarehouse.dbo.dimPolicyPeriod        b on a.PolicyPeriodDimId = b.ObjectId
+  inner join LatestWarehouse                          c on a.ApplicationDimId = c.MaxWarehouseId
+")
+
+RawFrequencySeverityByPeriod <- sqlQuery(myconn ,"
+with LatestWarehouse as (
+     select MaxWarehouseId = max(a.WarehouseId)
+     from XLDPWarehouse.dbo.dimApplication  a
+        left join XLDPWarehouse.dbo.dimDate d on a.ProspectivePolicyEffectiveDateDimId = d.ObjectId
+     where d.CalendarDate >= Concat(Year(GetDate()) - 6, '-01-01') 
+       and a.AccountId is not null
+       and a.ProposalNumber is not null 
+     group by
+      a.AccountId
+      ,a.ProposalNumber
+)
+
+select
+ a.*
+ ,PolicyPeriod = replace(replace(b.PolicyPeriodName ,' ' ,'') ,'PolicyPeriod' ,'')
+from XLDPWarehouse.dbo.fctXLDPModelFrequencyXSeverityPeriod a
+   left join XLDPWarehouse.dbo.dimPolicyPeriod              b on a.PolicyPeriodDimId = b.ObjectId
+  inner join LatestWarehouse                                c on a.ApplicationDimId = c.MaxWarehouseId
+")
+
+RawModelIncome <- sqlQuery(myconn ,"
+with LatestWarehouse as (
+     select MaxWarehouseId = max(a.WarehouseId)
+     from XLDPWarehouse.dbo.dimApplication  a
+        left join XLDPWarehouse.dbo.dimDate d on a.ProspectivePolicyEffectiveDateDimId = d.ObjectId
+     where d.CalendarDate >= Concat(Year(GetDate()) - 6, '-01-01') 
+       and a.AccountId is not null
+       and a.ProposalNumber is not null 
+     group by
+      a.AccountId
+      ,a.ProposalNumber
+)
+
+select
+ a.*
+ ,IncomeType = replace(replace(b.IncomeTypeName ,' ' ,'') ,'IncomeType' ,'')
+from XLDPWarehouse.dbo.fctXLDPModelIncome    a
+   left join XLDPWarehouse.dbo.dimIncomeType b on a.IncomeTypeDimId = b.ObjectId
+  inner join LatestWarehouse                 c on a.ApplicationDimId = c.MaxWarehouseId
+")
+
+RawInstantQuotePricing <- sqlQuery(myconn ,"
+with LatestWarehouse as (
+     select MaxWarehouseId = max(a.WarehouseId)
+     from XLDPWarehouse.dbo.dimApplication  a
+        left join XLDPWarehouse.dbo.dimDate d on a.ProspectivePolicyEffectiveDateDimId = d.ObjectId
+     where d.CalendarDate >= Concat(Year(GetDate()) - 6, '-01-01') 
+       and a.AccountId is not null
+       and a.ProposalNumber is not null 
+     group by
+      a.AccountId
+      ,a.ProposalNumber
+)
+
+select
+ a.*
+ ,StateProvince = replace(replace(b.StateProvinceName ,' ' ,'') ,'data' ,'')
+from XLDPWarehouse.dbo.fctXLDPModelInstantQuotePricing a
+   left join XLDPWarehouse.dbo.dimStateProvince        b on a.StateProvinceDimId = b.ObjectId
+  inner join LatestWarehouse                           c on a.ApplicationDimId = c.MaxWarehouseId
+where FinalInstantQuoteDividendPercentage is not null                                   
+")
+
+# RawInstantQuotePricingBucket <- sqlQuery(myconn ,"
+# with LatestWarehouse as (
+#      select MaxWarehouseId = max(a.WarehouseId)
+#      from XLDPWarehouse.dbo.dimApplication  a
+#         left join XLDPWarehouse.dbo.dimDate d on a.ProspectivePolicyEffectiveDateDimId = d.ObjectId
+#      where d.CalendarDate >= Concat(Year(GetDate()) - 6, '-01-01') 
+#        and a.AccountId is not null
+#        and a.ProposalNumber is not null 
+#      group by
+#       a.AccountId
+#       ,a.ProposalNumber
+# )
+# 
+# select
+#  a.*
+#  ,StateProvince      = replace(replace(b.StateProvinceName ,' ' ,'') ,'data' ,'')
+#  ,InstantQuoteBucket = replace(replace(InstantQuoteBucketName ,' ' ,'') ,'InstantQuotePricingScoreRange' ,'')
+# from XLDPWarehouse.dbo.fctXLDPModelInstantQuotePricingBucket a
+#    left join XLDPWarehouse.dbo.dimStateProvince        b on a.StateProvinceDimId = b.ObjectId
+#    left join XLDPWarehouse.dbo.dimInstantQuoteBucket   c on a.InstantQuoteBucketDimId = c.ObjectId
+#   inner join LatestWarehouse                           d on a.ApplicationDimId = d.MaxWarehouseId
+# where InstantQuotePricing <> 'Decline'                                         
+# ")
+
+# RawInstantQuoteScoreRange <- sqlQuery(myconn ,"
+# with LatestWarehouse as (
+#      select MaxWarehouseId = max(a.WarehouseId)
+#      from XLDPWarehouse.dbo.dimApplication  a
+#         left join XLDPWarehouse.dbo.dimDate d on a.ProspectivePolicyEffectiveDateDimId = d.ObjectId
+#      where d.CalendarDate >= Concat(Year(GetDate()) - 6, '-01-01') 
+#        and a.AccountId is not null
+#        and a.ProposalNumber is not null 
+#      group by
+#       a.AccountId
+#       ,a.ProposalNumber
+# )
+# 
+# select
+#  a.*
+#  ,InstantQuoteBucket = replace(replace(b.InstantQuoteBucketName ,' ' ,'') ,'InstantQuotePricingScoreRange' ,'')
+# from XLDPWarehouse.dbo.fctXLDPModelInstantQuoteScoreRange a
+#    left join XLDPWarehouse.dbo.dimInstantQuoteBucket      b on a.InstantQuoteBucketDimId = b.ObjectId
+#   inner join LatestWarehouse                              c on a.ApplicationDimId = c.MaxWarehouseId
+# ")
+
+RawModelLossAndExperience <- sqlQuery(myconn ,"
+with LatestWarehouse as (
+     select MaxWarehouseId = max(a.WarehouseId)
+     from XLDPWarehouse.dbo.dimApplication  a
+        left join XLDPWarehouse.dbo.dimDate d on a.ProspectivePolicyEffectiveDateDimId = d.ObjectId
+     where d.CalendarDate >= Concat(Year(GetDate()) - 6, '-01-01') 
+       and a.AccountId is not null
+       and a.ProposalNumber is not null 
+     group by
+      a.AccountId
+      ,a.ProposalNumber
+)
+
+select
+ a.*
+ ,PolicyPeriod = replace(replace(PolicyPeriodName ,' ' ,'') ,'PolicyPeriod' ,'')
+from XLDPWarehouse.dbo.fctXLDPModelLossAnnCombinedExperience a
+   left join XLDPWarehouse.dbo.dimPolicyPeriod               b on a.PolicyPeriodDimId = b.ObjectId
+  inner join LatestWarehouse                                 c on a.ApplicationDimId = c.MaxWarehouseId
+")
+
+RawIndemnityCountTrends <- sqlQuery(myconn ,"
+with LatestWarehouse as (
+     select MaxWarehouseId = max(a.WarehouseId)
+     from XLDPWarehouse.dbo.dimApplication  a
+        left join XLDPWarehouse.dbo.dimDate d on a.ProspectivePolicyEffectiveDateDimId = d.ObjectId
+     where d.CalendarDate >= Concat(Year(GetDate()) - 6, '-01-01') 
+       and a.AccountId is not null
+       and a.ProposalNumber is not null 
+     group by
+      a.AccountId
+      ,a.ProposalNumber
+)
+
+select
+ a.*
+ ,TrendType = replace(replace(b.TrendTypeName ,' ' ,'') ,'YearsWithICW' ,'')
+from XLDPWarehouse.dbo.fctXLDPModelLossIndemnityCountTrends a
+   left join XLDPWarehouse.dbo.dimTrendType                 b on a.TwoThreeYearsTrendTypeDimId = b.ObjectId
+  inner join LatestWarehouse                                c on a.ApplicationDimId = c.MaxWarehouseId
+")
+
+RawModelLossInfo <- sqlQuery(myconn ,"
+with LatestWarehouse as (
+     select MaxWarehouseId = max(a.WarehouseId)
+     from XLDPWarehouse.dbo.dimApplication  a
+        left join XLDPWarehouse.dbo.dimDate d on a.ProspectivePolicyEffectiveDateDimId = d.ObjectId
+     where d.CalendarDate >= Concat(Year(GetDate()) - 6, '-01-01') 
+       and a.AccountId is not null
+       and a.ProposalNumber is not null 
+     group by
+      a.AccountId
+      ,a.ProposalNumber
+)
+
+select
+ a.*
+from XLDPWarehouse.dbo.fctXLDPModelLossInfo a
+  inner join LatestWarehouse                c on a.ApplicationDimId = c.MaxWarehouseId
+")
+
+RawLossDevelopmentMethods <- sqlQuery(myconn ,"
+with LatestWarehouse as (
+     select MaxWarehouseId = max(a.WarehouseId)
+     from XLDPWarehouse.dbo.dimApplication  a
+        left join XLDPWarehouse.dbo.dimDate d on a.ProspectivePolicyEffectiveDateDimId = d.ObjectId
+     where d.CalendarDate >= Concat(Year(GetDate()) - 6, '-01-01') 
+       and a.AccountId is not null
+       and a.ProposalNumber is not null 
+     group by
+      a.AccountId
+      ,a.ProposalNumber
+)
+
+select
+ a.*
+ ,LossMethod = replace(replace(b.LossMethodName ,' ' ,'') ,'LossMethod' ,'')
+from XLDPWarehouse.dbo.fctXLDPModelPolicyLossDevelopmentEstimate a
+   left join XLDPWarehouse.dbo.dimLossMethod                     b on a.LossMethodDimId = b.ObjectId
+  inner join LatestWarehouse                                     c on a.ApplicationDimId = c.MaxWarehouseId
+")
+
+RawPriorPeriodLossDevelopmentMethods <- sqlQuery(myconn ,"
+with LatestWarehouse as (
+     select MaxWarehouseId = max(a.WarehouseId)
+     from XLDPWarehouse.dbo.dimApplication  a
+        left join XLDPWarehouse.dbo.dimDate d on a.ProspectivePolicyEffectiveDateDimId = d.ObjectId
+     where d.CalendarDate >= Concat(Year(GetDate()) - 6, '-01-01') 
+       and a.AccountId is not null
+       and a.ProposalNumber is not null 
+     group by
+      a.AccountId
+      ,a.ProposalNumber
+)
+
+select
+ a.*
+ ,LossMethod                 = replace(replace(b.LossMethodName ,' ' ,'') ,'LossMethod' ,'')
+ ,PolicyPeriod               = replace(replace(c.PolicyPeriodName ,' ' ,'') ,'PolicyPeriod' ,'')
+ ,LossAmountType             = replace(replace(d.LossAmountTypeName ,' ' ,'') ,'LossAmountType' ,'')
+ ,PolicyPeriodLossAmountType = concat(replace(replace(b.LossMethodName ,' ' ,'') ,'LossMethod' ,'') ,replace(replace(c.PolicyPeriodName ,' ' ,'') ,'PolicyPeriod' ,'') ,replace(replace(d.LossAmountTypeName ,' ' ,'') ,'LossAmountType' ,''))
+from XLDPWarehouse.dbo.fctXLDPModelPolicyLossDevelopmentPriorEstimate a
+   left join XLDPWarehouse.dbo.dimLossMethod                          b on a.LossMethodDimId = b.ObjectId
+   left join XLDPWarehouse.dbo.dimPolicyPeriod                        c on a.PolicyPeriodDimId = c.ObjectId
+   left join XLDPWarehouse.dbo.dimLossAmountType                      d on a.LossAmountTypeDimId = d.ObjectId
+  inner join LatestWarehouse                                          e on a.ApplicationDimId = e.MaxWarehouseId
+")
+
+RawPriorPeriodLossDevelopmentWeights <- sqlQuery(myconn ,"
+with LatestWarehouse as (
+     select MaxWarehouseId = max(a.WarehouseId)
+     from XLDPWarehouse.dbo.dimApplication  a
+        left join XLDPWarehouse.dbo.dimDate d on a.ProspectivePolicyEffectiveDateDimId = d.ObjectId
+     where d.CalendarDate >= Concat(Year(GetDate()) - 6, '-01-01') 
+       and a.AccountId is not null
+       and a.ProposalNumber is not null 
+     group by
+      a.AccountId
+      ,a.ProposalNumber
+)
+
+select
+ a.*
+ ,LossMethod                   = replace(replace(b.LossMethodName ,' ' ,'') ,'LossMethod' ,'')
+ ,PolicyPeriod                 = replace(replace(c.PolicyPeriodName ,' ' ,'') ,'PolicyPeriod' ,'')
+ ,PolicyPeriodLossMethodWeight = concat(replace(replace(b.LossMethodName ,' ' ,'') ,'LossMethod' ,'') ,replace(replace(c.PolicyPeriodName ,' ' ,'') ,'PolicyPeriod' ,''))
+from XLDPWarehouse.dbo.fctXLDPModelPolicyPeriodWeight a
+   left join XLDPWarehouse.dbo.dimLossMethod          b on a.LossMethodDimId = b.ObjectId
+   left join XLDPWarehouse.dbo.dimPolicyPeriod        c on a.PolicyPeriodDimId = c.ObjectId
+  inner join LatestWarehouse                          d on a.ApplicationDimId = d.MaxWarehouseId
+")
+
+RawModelPremium <- sqlQuery(myconn ,"
+with LatestWarehouse as (
+     select MaxWarehouseId = max(a.WarehouseId)
+     from XLDPWarehouse.dbo.dimApplication  a
+        left join XLDPWarehouse.dbo.dimDate d on a.ProspectivePolicyEffectiveDateDimId = d.ObjectId
+     where d.CalendarDate >= Concat(Year(GetDate()) - 6, '-01-01') 
+       and a.AccountId is not null
+       and a.ProposalNumber is not null 
+     group by
+      a.AccountId
+      ,a.ProposalNumber
+)
+
+select
+ a.*
+from XLDPWarehouse.dbo.fctXLDPModelPremium a
+  inner join LatestWarehouse               b on a.ApplicationDimId = b.MaxWarehouseId                            
+")
+
+RawModelSeverityByState <- sqlQuery(myconn ,"
+with LatestWarehouse as (
+     select MaxWarehouseId = max(a.WarehouseId)
+     from XLDPWarehouse.dbo.dimApplication  a
+        left join XLDPWarehouse.dbo.dimDate d on a.ProspectivePolicyEffectiveDateDimId = d.ObjectId
+     where d.CalendarDate >= Concat(Year(GetDate()) - 6, '-01-01') 
+       and a.AccountId is not null
+       and a.ProposalNumber is not null 
+     group by
+      a.AccountId
+      ,a.ProposalNumber
+)
+
+select
+ a.*
+ ,StateProvince      = replace(replace(b.StateProvinceName ,' ' ,'') ,'data' ,'')
+from XLDPWarehouse.dbo.fctXLDPModelSeverityByState a
+   left join XLDPWarehouse.dbo.dimStateProvince    b on a.StateProvinceDimId = b.ObjectId
+  inner join LatestWarehouse                       c on a.ApplicationDimId = c.MaxWarehouseId
+")
+
+RawModelSeverityTotal <- sqlQuery(myconn ,"
+with LatestWarehouse as (
+     select MaxWarehouseId = max(a.WarehouseId)
+     from XLDPWarehouse.dbo.dimApplication  a
+        left join XLDPWarehouse.dbo.dimDate d on a.ProspectivePolicyEffectiveDateDimId = d.ObjectId
+     where d.CalendarDate >= Concat(Year(GetDate()) - 6, '-01-01') 
+       and a.AccountId is not null
+       and a.ProposalNumber is not null 
+     group by
+      a.AccountId
+      ,a.ProposalNumber
+)
+
+select
+ a.*
+from XLDPWarehouse.dbo.fctXLDPModelSeverityTotal a
+  inner join LatestWarehouse                     b on a.ApplicationDimId = b.MaxWarehouseId                                  
+")
+
+RawDividendCredit <- sqlQuery(myconn ,"
+with LatestWarehouse as (
+     select MaxWarehouseId = max(a.WarehouseId)
+     from XLDPWarehouse.dbo.dimApplication  a
+        left join XLDPWarehouse.dbo.dimDate d on a.ProspectivePolicyEffectiveDateDimId = d.ObjectId
+     where d.CalendarDate >= Concat(Year(GetDate()) - 6, '-01-01') 
+       and a.AccountId is not null
+       and a.ProposalNumber is not null 
+     group by
+      a.AccountId
+      ,a.ProposalNumber
+)
+
+select
+ a.*
+ ,StateProvince                       = replace(replace(c.StateProvinceName ,' ' ,'') ,'data' ,'')
+ ,ScheduleDividendCreditCategory      = replace(replace(b.ScheduleDividendCreditCategoryName ,' ' ,'') ,'DividendCreditCategory' ,'')
+ ,StateProvinceDividendCreditCategory = concat(replace(replace(c.StateProvinceName ,' ' ,'') ,'data' ,'') ,replace(replace(b.ScheduleDividendCreditCategoryName ,' ' ,'') ,'DividendCreditCategory' ,''))
+from XLDPWarehouse.dbo.fctXLDPModelStateScheduleDividendCreditByCategory a
+   left join XLDPWarehouse.dbo.dimScheduleDividendCreditCategory         b on a.ScheduleDividendCreditCategoryDimId = b.ObjectId
+   left join XLDPWarehouse.dbo.dimStateProvince                          c on a.StateProvinceDimId = c.ObjectId
+  inner join LatestWarehouse                                             d on a.ApplicationDimId = d.MaxWarehouseId
+")
+
+RawCommissionAdjustmentPercentage <- sqlQuery(myconn ,"
+with LatestWarehouse as (
+     select MaxWarehouseId = max(a.WarehouseId)
+     from XLDPWarehouse.dbo.dimApplication  a
+        left join XLDPWarehouse.dbo.dimDate d on a.ProspectivePolicyEffectiveDateDimId = d.ObjectId
+     where d.CalendarDate >= Concat(Year(GetDate()) - 6, '-01-01') 
+       and a.AccountId is not null
+       and a.ProposalNumber is not null 
+     group by
+      a.AccountId
+      ,a.ProposalNumber
+)
+
+select
+ a.*
+ ,StateProvince = replace(replace(c.StateProvinceName ,' ' ,'') ,'data' ,'')
+from XLDPWarehouse.dbo.fctXLDPModelStateScheduleRating a
+left join XLDPWarehouse.dbo.dimStateProvince                          c on a.StateProvinceDimId = c.ObjectId
+inner join LatestWarehouse                                             d on a.ApplicationDimId = d.MaxWarehouseId                                              
+")
+
+RawScheduleRatingByCategory <- sqlQuery(myconn ,"
+with LatestWarehouse as (
+     select MaxWarehouseId = max(a.WarehouseId)
+     from XLDPWarehouse.dbo.dimApplication  a
+        left join XLDPWarehouse.dbo.dimDate d on a.ProspectivePolicyEffectiveDateDimId = d.ObjectId
+     where d.CalendarDate >= Concat(Year(GetDate()) - 6, '-01-01') 
+       and a.AccountId is not null
+       and a.ProposalNumber is not null 
+     group by
+      a.AccountId
+      ,a.ProposalNumber
+)
+
+select
+ a.*
+ ,StateProvince                       = replace(replace(b.StateProvinceName ,' ' ,'') ,'data' ,'')
+ ,ScheduleRatingCategory              = replace(replace(ScheduleRatingCategoryName ,' ' ,'') ,'ScheduleRatingCategory' ,'')
+ ,StateProvinceScheduleRatingCategory = concat(replace(replace(b.StateProvinceName ,' ' ,'') ,'data' ,'') ,replace(replace(ScheduleRatingCategoryName ,' ' ,'') ,'ScheduleRatingCategory' ,''))
+from XLDPWarehouse.dbo.fctXLDPModelStateScheduleRatingByCategory a
+   left join XLDPWarehouse.dbo.dimStateProvince                  b on a.StateProvinceDimId = b.ObjectId
+   left join XLDPWarehouse.dbo.dimScheduleRatingCategory         c on a.ScheduleRatingCategoryDimId = c.ObjectId
+  inner join LatestWarehouse                                     d on a.ApplicationDimId = d.MaxWarehouseId                                        
+")
+
+close(myconn)
+
+XldpFieldsToKeep <- c("InstantQuoteTierDescription" ,"InstantQuoteRating")
+
+#### Function to spread data rather than copying / pasting
+SpreadXldpData <- function(data ,term1 ,term2) {
+  
+  ColumnName <- str_c(term1 ,term2)
+  
+  Temp <- data %>%
+    mutate_if(is.factor ,as.character) %>%
+    filter(!is.na(!!sym(term2))) %>%
+    mutate(!!ColumnName := str_c(!!sym(term1) ,term2)) %>%
+    select(ApplicationDimId ,!!sym(ColumnName) ,!!sym(term2)) %>%
+    group_by(ApplicationDimId) %>%
+    spread(key = !!sym(ColumnName) ,value = !!sym(term2)) %>%
+    ungroup()
+  
+  ColumnsToKeep <- miss_var_summary(Temp) %>%
+    arrange(pct_miss ,variable) %>%
+    filter(pct_miss <= 50 | variable %in% XldpFieldsToKeep) %>%
+    select(variable) %>%
+    pull()
+  
+  Temp %>%
+    select(ColumnsToKeep)
+  
+}
+
+CleanXldpData <- function(data) {
+  
+  OriginalColumns <- colnames(data)
+  ColumnsToRemove <- c("WarehouseId" ,"ModelLastChangeReceivedDt" ,"DeletedDt" ,"CreatedDt" ,"XLDPModelMessageId")
+  NewColumns <- setdiff(OriginalColumns ,ColumnsToRemove)
+  
+  ColumnsToKeep <- data[,NewColumns] %>%
+    miss_var_summary() %>%
+    arrange(pct_miss ,variable) %>%
+    filter(pct_miss <= 50 | variable %in% XldpFieldsToKeep) %>%
+    select(variable) %>%
+    pull()
+  
+  data %>%
+    mutate_if(is.factor ,as.character) %>%
+    select(ColumnsToKeep)
+    
+}
+
+## dimApplication
+RawXldpApplication <- as_tibble(RawXldpApplication)
+
+ApplicationColumnsToKeep <- RawXldpApplication %>%
+  miss_var_summary() %>%
+  arrange(pct_miss ,variable) %>%
+  filter(pct_miss <= 50) %>%
+  select(variable) %>%
+  pull()
+
+RawXldpApplication <- RawXldpApplication %>%
+  mutate_if(is.factor ,as.character) %>%
+  select(ApplicationColumnsToKeep)
+
+## fctApplicationGeoExperienceModifier
+RawGeoExperienceModifier <- as_tibble(RawGeoExperienceModifier)
+
+GeoExperienceModifier <- SpreadXldpData(RawGeoExperienceModifier ,"StateOrBureau" ,"ExperienceModifierPublishedYesNoNA")
+
+## fctApplicationGeoExperienceModifierByPolicyPeriod
+RawGeoExperienceModifierByPolicyPeriod <- as_tibble(RawGeoExperienceModifierByPolicyPeriod)
+
+GeoExperienceModifierByPolicyPeriod <- SpreadXldpData(RawGeoExperienceModifierByPolicyPeriod ,"StateOrBureauWithPolicyPeriod" ,"ExperienceModifierFactorPercentage")
+
+## fctApplicationGeoProfile
+RawGeoProfile <- as_tibble(RawGeoProfile)
+
+RawGeoProfile <- RawGeoProfile %>%
+  rename(ScheduleCredit          = ScheduleCreditDebitAmountPercentage
+         ,SubjectPremium         = SubjectPremiumAmt
+         ,Payroll                = TotalPayrollAmt
+         ,IncreasedLimitsPremium = IncreasedLimitsPremiumAmt
+         ,ExpenseConstant        = ExpenseConstantAmt
+         ,CtrFactorStateYN       = ScheduleRatingCTRStateYN
+         ,CtrFactor              = ScheduleRatingCTRFactor
+         )
+
+GeoProfileRatesAIT <- SpreadXldpData(RawGeoProfile ,"StateProvinceName" ,"RatesApprovedAIT")
+GeoProfileScheduleCredit <- SpreadXldpData(RawGeoProfile ,"StateProvinceName" ,"ScheduleCredit")
+GeoProfileSubjectPremium <- SpreadXldpData(RawGeoProfile ,"StateProvinceName" ,"SubjectPremium")
+GeoProfilePayroll <- SpreadXldpData(RawGeoProfile ,"StateProvinceName" ,"Payroll")
+GeoProfileIncreasedLimitsPremium <- SpreadXldpData(RawGeoProfile ,"StateProvinceName" ,"IncreasedLimitsPremium")
+GeoProfileExpenseConstant <- SpreadXldpData(RawGeoProfile ,"StateProvinceName" ,"ExpenseConstant")
+GeoProfileCtrFactorStateYN <- SpreadXldpData(RawGeoProfile ,"StateProvinceName" ,"CtrFactorStateYN") 
+GeoProfileCtrFactor <- SpreadXldpData(RawGeoProfile ,"StateProvinceName" ,"CtrFactor") 
+
+## fctApplicationGeoTier
+RawGeoTier <- as_tibble(RawGeoTier)
+
+GeoTierRatingTier <- SpreadXldpData(RawGeoTier ,"StateProvinceName" ,"RatingTier")
+GeoTierSelectedTier <- SpreadXldpData(RawGeoTier ,"StateProvinceName" ,"SelectedTier")
+
+## fctApplicationLargeLosses
+
+#### Come back to this by combining it with fctApplicationLossExperience
+#### Can also maybe add Xmod from prior periods
+#### Need to impute a lot of the values from fctApplicationLossExperience
+#### Also are going to need to add periods to this table (Proposed, Expiring, etc...)
+
+## fctApplicationLocation
+RawLocation <- as_tibble(RawLocation)
+
+# XldpNumLocationsOrEmployees <- SpreadXldpData(RawLocation ,"StateCounty" ,"NumLocationsOrEmployees")
+
+TopLocationWithTies <- RawLocation %>%
+  mutate_if(is.factor ,as.character) %>%
+  filter(!is.na(NumLocationsOrEmployees) & NumLocationsOrEmployees > 0) %>%
+  mutate(StateCountyNumLocationsOrEmployees := str_c(StateCounty ,"NumLocationsOrEmployees")) %>%
+  select(WarehouseId ,ApplicationDimId ,StateCountyNumLocationsOrEmployees ,NumLocationsOrEmployees) %>%
+  group_by(ApplicationDimId) %>%
+  top_n(1 ,NumLocationsOrEmployees)
+
+TopLocationNoTies <- RawLocation %>%
+  mutate_if(is.factor ,as.character) %>%
+  mutate(StateCountyNumLocationsOrEmployees := str_c(StateCounty ,"NumLocationsOrEmployees")) %>%
+  inner_join(TopLocationWithTies ,by = c("WarehouseId" ,"ApplicationDimId" ,"StateCountyNumLocationsOrEmployees" ,"NumLocationsOrEmployees")) %>%
+  group_by(ApplicationDimId) %>%
+  summarise(MinWarehouseId = min(WarehouseId))
+
+TopLocation <- RawLocation %>%
+  inner_join(TopLocationNoTies ,by = c("WarehouseId" = "MinWarehouseId" ,"ApplicationDimId")) %>%
+  mutate(PrimaryStateCounty = str_c(StateProvinceName ," - " ,CountyName)) %>%
+  select(WarehouseId ,ApplicationDimId ,PrimaryStateCounty)
+
+## fctApplicationLossExperience
+
+#### Come back to this by combining it with fctApplicationLargeLosses
+
+## fctApplicationMiscCredit
+RawMiscCredit <- as_tibble(RawMiscCredit) %>%
+  CleanXldpData()
+
+## fctApplicationMiscCreditByState
+RawMiscCreditByState <- as_tibble(RawMiscCreditByState)
+
+RawMiscCreditByState <- RawMiscCreditByState %>%
+  rename(SafetyCredit             = SafetyCreditYesNoNA
+         ,DrugFreeCredit          = DrugFreeCreditYesNoNA
+         ,ContractorsCredit       = ContractorsCreditPercentage
+         ,MeritRating             = MeritRatingPercentage
+         ,SmallEmployerIncentive  = SmallEmployerIncentivePercentage
+         ,MiscCredit1             = MiscCredit1Percentage
+         ,SIMNSAElected           = SIMNSAElectedYN
+         ,HealthCareNetworkCredit = HealthCareNetworkCreditYesNoNA
+         ,WCPremiumReduction      = WCPremiumReductionYesNoNA
+         )
+
+MiscCreditByStateSafetyCredit <- SpreadXldpData(RawMiscCreditByState ,"StateMpnType" ,"SafetyCredit")
+MiscCreditByStateDrugFreeCredit <- SpreadXldpData(RawMiscCreditByState ,"StateMpnType" ,"DrugFreeCredit")
+MiscCreditByStateContractorsCredit <- SpreadXldpData(RawMiscCreditByState ,"StateMpnType" ,"ContractorsCredit")
+MiscCreditByStateMeritRating <- SpreadXldpData(RawMiscCreditByState ,"StateMpnType" ,"MeritRating")
+MiscCreditByStateSmallEmployerIncentive <- SpreadXldpData(RawMiscCreditByState ,"StateMpnType" ,"SmallEmployerIncentive")
+MiscCreditByStateMiscCredit <- SpreadXldpData(RawMiscCreditByState ,"StateMpnType" ,"MiscCredit1")
+MiscCreditByStateSIMNSAElected <- SpreadXldpData(RawMiscCreditByState ,"StateMpnType" ,"SIMNSAElected")
+MiscCreditByStateHealthCareNetworkCredit <- SpreadXldpData(RawMiscCreditByState ,"StateMpnType" ,"HealthCareNetworkCredit")
+MiscCreditByStateWCPremiumReduction <- SpreadXldpData(RawMiscCreditByState ,"StateMpnType" ,"WCPremiumReduction")
+
+## fctApplicationPayroll
+
+#### NJ doesn't have NJ.8810 suffix even though it should
+#### ApplicationDimId = 2101182; AccountId = 1071011 & ProposalNumber = 1
+#### Should ask IT about this
+#### You do already have a RawPayroll variable; changes will need to be made to the query
+
+## fctXLDPModel
+RawXldpModel <- as_tibble(RawXldpModel) %>%
+  CleanXldpData()
+
+## fctXLDPModelClassFitAdjustment
+RawClassFitAdjustment <- as_tibble(RawClassFitAdjustment)
+
+ClassFitAdjustment <- SpreadXldpData(RawClassFitAdjustment ,"ClassFitAdjustmentCategory" ,"ClassFitAdjustmentAmt")
+ClassFitLossPercentage <- SpreadXldpData(RawClassFitAdjustment ,"ClassFitAdjustmentCategory" ,"ClassFitAdjustmentLossPercentage")
+ClassFitPremiumPercentage <- SpreadXldpData(RawClassFitAdjustment ,"ClassFitAdjustmentCategory" ,"ClassFitAdjustmentPremiumPercentage")
+
+## fctXLDPModelClassFitScoring
+#### Had to have multiple queries pulling in ClassFit due to issue in the db
+#### Can talk with IT to correct this as well
+RawClassFitScoring <- as_tibble(RawClassFitScoring)
+RawClassFitScoring2 <- as_tibble(RawClassFitScoring2)
+RawClassFitScoring3 <- as_tibble(RawClassFitScoring3)
+
+ClassFitScore <- SpreadXldpData(RawClassFitScoring ,"ClassFitGroup_Category_ScoreType" ,"ClassFitScore") %>%
+  left_join(SpreadXldpData(RawClassFitScoring2 ,"ClassFitGroup_Category_ScoreType" ,"ClassFitScore") ,by = "ApplicationDimId")
+ClassFitValuePercentage <- SpreadXldpData(RawClassFitScoring3 ,"ClassFitGroup_Category_ScoreType" ,"ClassFitValuePercentage")
+
+## fctXLDPModelExpenseGroup
+RawExpenseGroup <- as_tibble(RawExpenseGroup) %>%
+  rename(Expense = ExpenseAmt)
+
+XldpExpenses <- SpreadXldpData(RawExpenseGroup ,"ExpenseTypeName" ,"Expense")
+XldpExpensePercentage <- SpreadXldpData(RawExpenseGroup ,"ExpenseTypeName" ,"ExpensePercentage")
+
+## fctXLDPModelExperienceModifier
+RawWtdExperienceModifier <- as_tibble(RawWtdExperienceModifier) %>%
+  rename(PrincipalStateWtdXmod = PrincipalStateWeightedExperienceModifierPercentage)
+
+PrincipalStateWtdXmod <- SpreadXldpData(RawWtdExperienceModifier ,"PolicyPeriod" ,"PrincipalStateWtdXmod")
+
+## fctXLDPModelFrequencyXSeverityPeriod
+RawFrequencySeverityByPeriod <- as_tibble(RawFrequencySeverityByPeriod)
+
+HistoricalUltimateMedOnly <- SpreadXldpData(RawFrequencySeverityByPeriod ,"PolicyPeriod" ,"UltimateMedicalOnlyCount")
+HistoricalUltimateIndemnityCount <- SpreadXldpData(RawFrequencySeverityByPeriod ,"PolicyPeriod" ,"UltimateIndemnityCount")
+HistoricalClaimCountCredibilityPercentage <- SpreadXldpData(RawFrequencySeverityByPeriod ,"PolicyPeriod" ,"ClaimCountCredibilityPercentage")
+HistoricalCredibilityWeightedIndemnityCount <- SpreadXldpData(RawFrequencySeverityByPeriod ,"PolicyPeriod" ,"CredibilityWeightedIndemnityCount")
+HistoricalAdjustedCredibilityWeightedIndemnityCount <- SpreadXldpData(RawFrequencySeverityByPeriod ,"PolicyPeriod" ,"AdjustedCredibilityWeightedIndemnityCount")
+
+## fctXLDPModelIncome
+RawModelIncome <- as_tibble(RawModelIncome) %>%
+  rename(Income = IncomeAmt)
+
+ModelIncome <- SpreadXldpData(RawModelIncome ,"IncomeType" ,"Income")
+ModelIncomePercentage <- SpreadXldpData(RawModelIncome ,"IncomeType" ,"IncomePercentage")
+
+## fctXLDPModelInstantQuotePricing
+RawInstantQuotePricing <- as_tibble(RawInstantQuotePricing)
+
+InstantQuoteDividends <- SpreadXldpData(RawInstantQuotePricing ,"StateProvince" ,"FinalInstantQuoteDividendPercentage")
+
+#### Removed to limit the number of columns in the FinalDataset
+## fctXLDPModelInstantQuotePricingBucket
+# RawInstantQuotePricingBucket <- as_tibble(RawInstantQuotePricingBucket) %>%
+#   mutate(StateProvinceInstantQuoteBucket = str_c(StateProvince ,InstantQuoteBucket))
+# 
+# InstantQuoteBucket <- SpreadXldpData(RawInstantQuotePricingBucket ,"StateProvinceInstantQuoteBucket" ,"InstantQuotePricing")
+
+#### Removed to limit the number of columns in the FinalDataset
+## fctXLDPModelInstantQuoteScoreRange
+# RawInstantQuoteScoreRange <- as_tibble(RawInstantQuoteScoreRange)
+# 
+# InstantQuotePricingScoreRangeMin <- SpreadXldpData(RawInstantQuoteScoreRange ,"InstantQuoteBucket" ,"InstantQuotePricingScoreRangeMin")
+# InstantQuotePricingScoreRangeMax <- SpreadXldpData(RawInstantQuoteScoreRange ,"InstantQuoteBucket" ,"InstantQuotePricingScoreRangeMax")
+# InstantQuotePricingScoreRangeAboveMax <- SpreadXldpData(RawInstantQuoteScoreRange ,"InstantQuoteBucket" ,"InstantQuotePricingScoreRangeAboveMaxYN")
+
+## fctXLDPModelLossAnnCombinedExperience
+RawModelLossAndExperience <- as_tibble(RawModelLossAndExperience)
+
+HistoricalCarrier <- SpreadXldpData(RawModelLossAndExperience ,"PolicyPeriod" ,"CarrierName")
+HistoricalPremium <- SpreadXldpData(RawModelLossAndExperience ,"PolicyPeriod" ,"PremiumAmt")
+HistoricalAdjustedPayroll <- SpreadXldpData(RawModelLossAndExperience ,"PolicyPeriod" ,"WageAdjustedPayrollAmt")
+HistoricalChangeInPayroll <- SpreadXldpData(RawModelLossAndExperience ,"PolicyPeriod" ,"PayrollChangePercentage")
+
+## fctXLDPModelLossIndemnityCountTrends
+RawIndemnityCountTrends <- as_tibble(RawIndemnityCountTrends)
+
+IndemnityCountTrends <- SpreadXldpData(RawIndemnityCountTrends ,"TrendType" ,"TwoThreeYearsTrendPercentage")
+
+## fctXLDPModelLossInfo
+RawModelLossInfo <- as_tibble(RawModelLossInfo) %>%
+  CleanXldpData()
+
+## fctXLDPModelPolicyLossDevelopmentEstimate
+RawLossDevelopmentMethods <- as_tibble(RawLossDevelopmentMethods)
+
+LossDevelopmentEstimate <- SpreadXldpData(RawLossDevelopmentMethods ,"LossMethod" ,"MethodEstimate")
+LossDevelopmentWeights <- SpreadXldpData(RawLossDevelopmentMethods ,"LossMethod" ,"MethodEstimateWeightPercentage")
+
+## fctXLDPModelPolicyLossDevelopmentPriorEstimate
+RawPriorPeriodLossDevelopmentMethods <- as_tibble(RawPriorPeriodLossDevelopmentMethods) %>%
+  rename(MethodPriorEstimate = MethodPriorEstimateAmt)
+
+PriorPeriodLossDevelopmentMethodEstimates <- SpreadXldpData(RawPriorPeriodLossDevelopmentMethods ,"PolicyPeriodLossAmountType" ,"MethodPriorEstimate")
+
+## fctXLDPModelPolicyPeriodWeight
+RawPriorPeriodLossDevelopmentWeights <- as_tibble(RawPriorPeriodLossDevelopmentWeights)
+
+PriorPeriodLossDevelopmentWeights <- SpreadXldpData(RawPriorPeriodLossDevelopmentWeights ,"PolicyPeriodLossMethodWeight" ,"PolicyPeriodWeight")
+
+## fctXLDPModelPremium
+RawModelPremium <- as_tibble(RawModelPremium) %>%
+  CleanXldpData()
+
+## fctXLDPModelPremiumByClass
+
+#### There are duplicates with the class codes
+#### ApplicationDimId = 2121627 and ClassDimId = 768; AccountId = 1071011 / ProposalNumber = 2
+
+## fctXLDPModelSeverityByState
+RawModelSeverityByState <- as_tibble(RawModelSeverityByState) %>%
+  rename(Payroll                    = PayrollAmt
+         ,IndustryIndemnitySeverity = IndustryIndemnitySeverityAmt
+         ,IndemnitySeverity         = IndemnitySeverityAmt
+         ,AverageWeeklyWage         = AverageWeeklyWageAmt
+         )
+
+StatePayroll <- SpreadXldpData(RawModelSeverityByState ,"StateProvince" ,"Payroll")
+StateIndustryIndemnitySeverity <- SpreadXldpData(RawModelSeverityByState ,"StateProvince" ,"IndustryIndemnitySeverity")
+StateIcwGroupSeverity <- SpreadXldpData(RawModelSeverityByState ,"StateProvince" ,"ICWGroupSeverityFactor")
+StateClassDifferential <- SpreadXldpData(RawModelSeverityByState ,"StateProvince" ,"ClassDifferential")
+StateClassFitSeverityAdjustment <- SpreadXldpData(RawModelSeverityByState ,"StateProvince" ,"ClassFitSeverityAdjustmentFactor")
+StateIndemnitySeverity <- SpreadXldpData(RawModelSeverityByState ,"StateProvince" ,"IndemnitySeverity")
+StateExpectedIndemnityClaims <- SpreadXldpData(RawModelSeverityByState ,"StateProvince" ,"ExpectedIndemnityClaims")
+StateAverageWeeklyWage <- SpreadXldpData(RawModelSeverityByState ,"StateProvince" ,"AverageWeeklyWage")
+StateRateAdequacyAdjustment <- SpreadXldpData(RawModelSeverityByState ,"StateProvince" ,"RateAdequacyAdjustment")
+StateRateAdequacyAdjustmentTotal <- SpreadXldpData(RawModelSeverityByState ,"StateProvince" ,"RateAdequacyAdjustmentTotal")
+StateFrequencyTemperingFactor <- SpreadXldpData(RawModelSeverityByState ,"StateProvince" ,"FrequencyTemperingFactor")
+StateClassCappingRateAdequacy <- SpreadXldpData(RawModelSeverityByState ,"StateProvince" ,"ClassCappingRateAdequacy")
+
+## fctXLDPModelSeverityTotal
+RawModelSeverityTotal <- as_tibble(RawModelSeverityTotal) %>%
+  CleanXldpData()
+
+## fctXLDPModelStateScheduleDividendCreditByCategory
+RawDividendCredit <- as_tibble(RawDividendCredit)
+
+DividendCredit <- SpreadXldpData(RawDividendCredit ,"StateProvinceDividendCreditCategory" ,"ScheduleDividendCreditPercentage")
+
+## fctXLDPModelStateScheduleRating
+RawCommissionAdjustmentPercentage <- as_tibble(RawCommissionAdjustmentPercentage)
+
+CommissionAdjustmentPercentage <- SpreadXldpData(RawCommissionAdjustmentPercentage ,"StateProvince" ,"CommissionAdjustmentPercentage")
+
+## fctXLDPModelStateScheduleRatingByCategory
+RawScheduleRatingByCategory <- as_tibble(RawScheduleRatingByCategory)
+
+ScheduleRatingByCategory <- SpreadXldpData(RawScheduleRatingByCategory ,"StateProvinceScheduleRatingCategory" ,"ScheduleRatingPercentage")
+
+## Combined Data
+FinalXldpWarehouseData <- RawXldpApplication %>%
+  left_join(GeoExperienceModifier ,by = c("WarehouseId" = "ApplicationDimId")) %>%
+  left_join(GeoExperienceModifierByPolicyPeriod ,by = c("WarehouseId" = "ApplicationDimId")) %>%
+  left_join(GeoProfileRatesAIT ,by = c("WarehouseId" = "ApplicationDimId")) %>%
+  left_join(GeoProfileScheduleCredit ,by = c("WarehouseId" = "ApplicationDimId")) %>%
+  left_join(GeoProfileSubjectPremium ,by = c("WarehouseId" = "ApplicationDimId")) %>%
+  left_join(GeoProfilePayroll ,by = c("WarehouseId" = "ApplicationDimId")) %>%
+  left_join(GeoProfileIncreasedLimitsPremium ,by = c("WarehouseId" = "ApplicationDimId")) %>%
+  left_join(GeoProfileExpenseConstant ,by = c("WarehouseId" = "ApplicationDimId")) %>%
+  left_join(MiscCreditByStateSIMNSAElected ,by = c("WarehouseId" = "ApplicationDimId")) %>%
+  left_join(GeoProfileCtrFactorStateYN ,by = c("WarehouseId" = "ApplicationDimId")) %>%
+  left_join(GeoProfileCtrFactor ,by = c("WarehouseId" = "ApplicationDimId")) %>%
+  left_join(GeoTierRatingTier ,by = c("WarehouseId" = "ApplicationDimId")) %>%
+  left_join(GeoTierSelectedTier ,by = c("WarehouseId" = "ApplicationDimId")) %>%
+  left_join(TopLocation ,by = c("WarehouseId" = "ApplicationDimId")) %>%
+  left_join(RawMiscCredit ,by = c("WarehouseId" = "ApplicationDimId")) %>%
+  left_join(MiscCreditByStateSafetyCredit ,by = c("WarehouseId" = "ApplicationDimId")) %>%
+  left_join(MiscCreditByStateDrugFreeCredit ,by = c("WarehouseId" = "ApplicationDimId")) %>%
+  left_join(MiscCreditByStateContractorsCredit ,by = c("WarehouseId" = "ApplicationDimId")) %>%
+  left_join(MiscCreditByStateMeritRating ,by = c("WarehouseId" = "ApplicationDimId")) %>%
+  left_join(MiscCreditByStateSmallEmployerIncentive ,by = c("WarehouseId" = "ApplicationDimId")) %>%
+  left_join(MiscCreditByStateSIMNSAElected ,by = c("WarehouseId" = "ApplicationDimId")) %>%
+  left_join(MiscCreditByStateHealthCareNetworkCredit ,by = c("WarehouseId" = "ApplicationDimId")) %>%
+  left_join(MiscCreditByStateWCPremiumReduction ,by = c("WarehouseId" = "ApplicationDimId")) %>%
+  left_join(RawXldpModel ,by = c("WarehouseId" = "ApplicationDimId")) %>%
+  left_join(ClassFitAdjustment ,by = c("WarehouseId" = "ApplicationDimId")) %>%
+  left_join(ClassFitLossPercentage ,by = c("WarehouseId" = "ApplicationDimId")) %>%
+  left_join(ClassFitPremiumPercentage ,by = c("WarehouseId" = "ApplicationDimId")) %>%
+  left_join(ClassFitScore ,by = c("WarehouseId" = "ApplicationDimId")) %>%
+  left_join(ClassFitValuePercentage ,by = c("WarehouseId" = "ApplicationDimId")) %>%
+  left_join(XldpExpenses ,by = c("WarehouseId" = "ApplicationDimId")) %>%
+  left_join(XldpExpensePercentage ,by = c("WarehouseId" = "ApplicationDimId")) %>%
+  left_join(PrincipalStateWtdXmod ,by = c("WarehouseId" = "ApplicationDimId")) %>%
+  left_join(HistoricalUltimateMedOnly ,by = c("WarehouseId" = "ApplicationDimId")) %>%
+  left_join(HistoricalUltimateIndemnityCount ,by = c("WarehouseId" = "ApplicationDimId")) %>%
+  left_join(HistoricalClaimCountCredibilityPercentage ,by = c("WarehouseId" = "ApplicationDimId")) %>%
+  left_join(HistoricalCredibilityWeightedIndemnityCount ,by = c("WarehouseId" = "ApplicationDimId")) %>%
+  left_join(HistoricalAdjustedCredibilityWeightedIndemnityCount ,by = c("WarehouseId" = "ApplicationDimId")) %>%
+  left_join(ModelIncome ,by = c("WarehouseId" = "ApplicationDimId")) %>%
+  left_join(ModelIncomePercentage ,by = c("WarehouseId" = "ApplicationDimId")) %>%
+  left_join(InstantQuoteDividends ,by = c("WarehouseId" = "ApplicationDimId")) %>%
+  # left_join(InstantQuoteBucket ,by = c("WarehouseId" = "ApplicationDimId")) %>%
+  # left_join(InstantQuotePricingScoreRangeMin ,by = c("WarehouseId" = "ApplicationDimId")) %>%
+  # left_join(InstantQuotePricingScoreRangeMax ,by = c("WarehouseId" = "ApplicationDimId")) %>%
+  # left_join(InstantQuotePricingScoreRangeAboveMax ,by = c("WarehouseId" = "ApplicationDimId")) %>%
+  left_join(HistoricalCarrier ,by = c("WarehouseId" = "ApplicationDimId")) %>%
+  left_join(HistoricalPremium ,by = c("WarehouseId" = "ApplicationDimId")) %>%
+  left_join(HistoricalAdjustedPayroll ,by = c("WarehouseId" = "ApplicationDimId")) %>%
+  left_join(HistoricalChangeInPayroll ,by = c("WarehouseId" = "ApplicationDimId")) %>%
+  left_join(IndemnityCountTrends ,by = c("WarehouseId" = "ApplicationDimId")) %>%
+  left_join(RawModelLossInfo ,by = c("WarehouseId" = "ApplicationDimId")) %>%
+  left_join(LossDevelopmentEstimate ,by = c("WarehouseId" = "ApplicationDimId")) %>%
+  left_join(LossDevelopmentWeights ,by = c("WarehouseId" = "ApplicationDimId")) %>%
+  left_join(PriorPeriodLossDevelopmentMethodEstimates ,by = c("WarehouseId" = "ApplicationDimId")) %>%
+  left_join(PriorPeriodLossDevelopmentWeights ,by = c("WarehouseId" = "ApplicationDimId")) %>%
+  left_join(StatePayroll ,by = c("WarehouseId" = "ApplicationDimId")) %>%
+  left_join(StateIndustryIndemnitySeverity ,by = c("WarehouseId" = "ApplicationDimId")) %>%
+  left_join(StateIcwGroupSeverity ,by = c("WarehouseId" = "ApplicationDimId")) %>%
+  left_join(StateClassDifferential ,by = c("WarehouseId" = "ApplicationDimId")) %>%
+  left_join(StateClassFitSeverityAdjustment ,by = c("WarehouseId" = "ApplicationDimId")) %>%
+  left_join(StateIndemnitySeverity ,by = c("WarehouseId" = "ApplicationDimId")) %>%
+  left_join(StateExpectedIndemnityClaims ,by = c("WarehouseId" = "ApplicationDimId")) %>%
+  left_join(StateAverageWeeklyWage ,by = c("WarehouseId" = "ApplicationDimId")) %>%
+  left_join(StateRateAdequacyAdjustment ,by = c("WarehouseId" = "ApplicationDimId")) %>%
+  left_join(StateRateAdequacyAdjustmentTotal ,by = c("WarehouseId" = "ApplicationDimId")) %>%
+  left_join(StateFrequencyTemperingFactor ,by = c("WarehouseId" = "ApplicationDimId")) %>%
+  left_join(StateClassCappingRateAdequacy ,by = c("WarehouseId" = "ApplicationDimId")) %>%
+  left_join(RawModelSeverityTotal ,by = c("WarehouseId" = "ApplicationDimId")) %>%
+  left_join(DividendCredit ,by = c("WarehouseId" = "ApplicationDimId")) %>%
+  left_join(CommissionAdjustmentPercentage ,by = c("WarehouseId" = "ApplicationDimId")) %>%
+  left_join(ScheduleRatingByCategory ,by = c("WarehouseId" = "ApplicationDimId"))
+
+## Removing unneccessary datasets to increase performance
+rm(list=setdiff(ls(), c("FinalAlteryxData" ,"SubmissionsWithTriaInfo" ,"PolicyLevelClaims" ,"InterpolatedReservingLossLdfs" ,"InterpolatedReservingAlaeLdfs" ,"AverageInterpolatedLossLdfs" ,"AverageInterpolatedAlaeLdfs" ,"SnapFieldsFinal" ,"FinalXldpWarehouseData" ,"OlfData" ,"ReserveTemplateLers" ,"AverageLers" ,"EvaluationDate" ,"CombinedDataset" ,"InforceDateRange" ,"AvgTemperedLer200k" ,"AvgTemperedLer1m" ,"ClassCodeLookups")))
+
+#####################################################################################
+## CTR Calculation --New Section
+#####################################################################################
+
+RawCTRLookups <- readxl::read_excel("P:/EXCEL/ACTUARIA/Rate Change/rate change sql/Supporting Tables/CTR/CTR_rates.xls" ,sheet = "CTR_rate")
+ 
+# Formatting SymPolMod to match combined dataset format
+RawCTRLookups$SymPolMod <- stringr::str_replace(RawCTRLookups$SymPolMod, "-", " ")
+RawCTRLookups$SymPolMod <- stringr::str_replace(RawCTRLookups$SymPolMod, "-", " ")
+
+CTRLookups <- RawCTRLookups %>%
+  rename(CTR_State = State) %>%
+  select(-c(EffDt))
+
+#####################################################################################
+## Class Description --New Section
+#####################################################################################
+
+RawClassCodeLookups <- readxl::read_excel("//newfs5/EXCEL/ACTUARIA/ACTUARIAL/SubmissionDataset/Old/Lookups/Class Code Lookups (Non-dup).xlsx" ,sheet = "Lookup")
+
+colnames(RawClassCodeLookups) <- str_remove_all(colnames(RawClassCodeLookups) ,pattern = " ")
+
+##For some reason, sql and R encode '-' differently. We'll replace it with --.
+RawClassCodeLookups$Description <- str_replace_all(RawClassCodeLookups$Description, '-', '-')
+
+ClassCodeLookups <- RawClassCodeLookups %>%
+  mutate( StateAbbrClassCode    = str_c(StateAbbr ,"." ,ClassCode)
+         ,ClassCodeDescription = str_to_title(Description)
+         ,Id                   = row_number()) %>%
+  rename(BureauIndustryGroup = IndustryGroup2) %>%
+  select(Id ,contains("Class") ,everything() ,-c(State ,StateAbbr ,ClassCode)) 
+
+## Uploading the data to SQL
+
+myconn <- dbConnect(odbc::odbc(),
+                    driver = "SQL Server",
+                    database = "ActuarialPlayPantry",
+                    server = "DC1RPTDBDEV01")
+
+TableName <- DBI::Id(schema = "rrr"
+                     ,table  = "Lookup_IndustryGroup")
+
+dbRemoveTable(myconn ,TableName)
+dbWriteTable(myconn ,name = TableName ,value = ClassCodeLookups ,row.names = FALSE ,overwrite = TRUE, 
+             field.types = c(Id = "int", StateAbbrClassCode="varchar(255)", ClassCodeDescription="varchar(255)",
+                             Description="varchar(255)", IndustryGroup="varchar(255)", BureauIndustryGroup="varchar(255)" ))
+dbExecute(myconn, "alter table ActuarialPlayPantry.rrr.Lookup_IndustryGroup alter column Id int not null")
+dbExecute(myconn, "alter table ActuarialPlayPantry.rrr.Lookup_IndustryGroup add primary key (Id)")
+
+dbDisconnect(myconn)
+
+#remove duplicate Classcodes
+ClassCodeLookups = ClassCodeLookups %>% 
+  select(- Id) %>%
+  distinct()
+
+#####################################################################################
+## Combining Datasets --New Section
+#####################################################################################
+
+AgeFunction <- function(EffectiveDate ,ExpirationDate ,PolicyEvaluationDate ,LdfLag) {
+
+  RoundedEffectiveDate <- floor_date(EffectiveDate ,unit = "month")
+  RoundedExpirationDate <- floor_date(ExpirationDate ,unit = "month")
+  RoundedPolicyEvaluationDate <- round_date(PolicyEvaluationDate ,unit = "month")
+
+  IntervalEffectiveEval <- interval(RoundedEffectiveDate ,RoundedPolicyEvaluationDate)
+  IntervalEffectiveCancTerm <- interval(RoundedEffectiveDate ,RoundedExpirationDate)
+
+  PolicyLength <- IntervalEffectiveCancTerm %/% months(1)
+  PolicyAge <- IntervalEffectiveEval %/% months(1)
+  PolicyLag <- pmin(PolicyAge / 2 ,PolicyLength / 2)
+
+  LagAdjustedPolicyAge <- PolicyAge - (PolicyLag - LdfLag)
+
+  return(LagAdjustedPolicyAge)
+}
+
+EarnedPercent <- function(EffectiveDate ,ExpirationDate ,PolicyEvaluationDate) {
+
+  IntervalEffectiveEvaluation <- interval(EffectiveDate ,PolicyEvaluationDate)
+  IntervalEffectiveExpiration <- interval(EffectiveDate ,ExpirationDate)
+
+  LengthOfPolicy <- IntervalEffectiveExpiration %/% days(1)
+  DaysEarned <- ifelse(PolicyEvaluationDate <= ExpirationDate ,IntervalEffectiveEvaluation %/% days(1) ,IntervalEffectiveExpiration %/% days(1))
+
+  EarnedPercentage <- ifelse(LengthOfPolicy == 0 ,0 ,DaysEarned / LengthOfPolicy)
+  EarnedPercentage <- pmax(pmin(EarnedPercentage ,1) ,0)
+
+  return(EarnedPercentage)
+}
+
+InforceDateRange <- function(EffectiveDate ,ExpirationDate ,EvaluationDate) {
+  InforceFlag <- EffectiveDate <= EvaluationDate & ExpirationDate > EvaluationDate
+  
+  return(InforceFlag)
+}
+
+LabelsVector <- NULL
+
+LabelFunction <- function (BreaksVector ,Commas = TRUE ,DecimalPlaces = 0) {
+  for (i in 1:(length(BreaksVector)-1)) {
+    FirstNumber <- ifelse(BreaksVector[i] == 0 ,0 ,ifelse(Commas ,formatC(BreaksVector[i] ,big.mark = "," ,digits = DecimalPlaces ,format = "f") ,formatC(BreaksVector[i] ,digits = DecimalPlaces ,format = "f")))
+    SecondNumber <- ifelse(BreaksVector[i+1] == 0 ,0 ,ifelse(Commas ,formatC(BreaksVector[i+1] ,big.mark = "," ,digits = DecimalPlaces ,format = "f") ,formatC(BreaksVector[i+1] ,digits = DecimalPlaces ,format = "f")))
+    FirstLabel <- ifelse(length(BreaksVector)>10 ,str_pad(i ,width = 2 ,side = "left" ,pad = "0") ,i)
+    LabelsVector[i] <- str_c(FirstLabel, ') ' ,FirstNumber ,' - ' ,SecondNumber)
+  }
+  return(LabelsVector)
+}
+
+EvaluationDate <- PolicyLevelClaims %>%
+  select(ClaimEvaluationDate) %>%
+  unique() %>%
+  pull()
+HubLevels <- SubmissionsWithTriaInfo %>%
+  count(Hub ,sort = TRUE) %>%
+  pull(Hub)
+MinReinsuranceExpense <- SnapFieldsFinal %>%
+  summarise(min(as.numeric(`WC:Rating:Output_reinsuranceExpenseFactor`) ,na.rm = TRUE)) %>%
+  pull()
+MaxReinsuranceExpense <- SnapFieldsFinal %>%
+  summarise(max(as.numeric(`WC:Rating:Output_reinsuranceExpenseFactor`) ,na.rm = TRUE)) %>%
+  pull()
+MinMedicalOnlyLoad <- FinalXldpWarehouseData %>%
+  summarise(min(as.numeric(MedicalOnlyLoadPercentage) ,na.rm = TRUE)) %>%
+  pull()
+MaxMedicalOnlyLoad <- FinalXldpWarehouseData %>%
+  summarise(max(as.numeric(MedicalOnlyLoadPercentage) ,na.rm = TRUE)) %>%
+  pull()
+MinAlaeLoad <- FinalXldpWarehouseData %>%
+  summarise(min(as.numeric(ALAELoadPercentage) ,na.rm = TRUE)) %>%
+  pull()
+MaxAlaeLoad <- FinalXldpWarehouseData %>%
+  summarise(max(as.numeric(ALAELoadPercentage) ,na.rm = TRUE)) %>%
+  pull()
+
+KRatioBandBreaks <- c(0, seq(from = 60 ,to = 120 ,by = 15) ,Inf)
+KMinusXRatioBandBreaks <- c(-Inf, seq(from = -50 ,to = 20 ,by = 5) ,Inf)
+CalcXmodMinusXmodBandBreaks <- c(-Inf ,-.5 ,-.25 ,-.1 ,0 ,.1 ,.25 ,Inf)
+HazardGroupBreaks <- c(0 ,2 ,7)
+PremiumBreaks <-  c(0 ,100000 ,250000 ,500000 ,1250000 ,Inf)
+XmodBreaks <- c(0 ,.9 ,1.15 ,1.35 ,Inf)
+ClassDifferentialBreaks <- c(0 ,1 ,Inf)
+CombinedRatioBreaks <- c(-Inf, seq(from = 0.80 ,to = 1.10 ,by = .05) ,Inf)
+CommissionBreaks <- c(0 ,8 ,10 ,12 ,14 ,Inf)
+ClassFitBugsBreaks <- c(-Inf ,-5 ,0 ,5 ,10 ,Inf)
+GeneralBugsBreaks <- c(-Inf ,-5 ,0 ,5 ,Inf)
+XRatioBandBreaks <- c(-Inf ,80 ,90 ,100 ,110 ,120 ,Inf)
+RiskScoreBreaks <- c(-Inf ,.9 ,1 ,1.1 ,1.2 ,1.3 ,Inf)
+DeviationOffManualPremiumBreaks <- c(-Inf ,50 ,70 ,90 ,110 ,130 ,Inf)
+
+CombinedDataset <- SubmissionsWithTriaInfo %>%
+  mutate_if(is.factor ,as.character) %>%
+  filter(DateEffective <= EvaluationDate) %>%
+  left_join(FinalXldpWarehouseData ,by = c("Quote_ID" = "AccountId" ,"proposal_number" = "ProposalNumber")) %>%
+  left_join(SnapFieldsFinal ,by = c("Quote_ID" = "SubmissionNumber" ,"proposal_number" = "ProposalNumber")) %>%
+  mutate(StateClass = case_when((is.na(GoverningState) | is.na(GoverningClass.x)) ~ as.character(NA)
+                                ,!(str_detect(GoverningClass.x ,pattern = "-")) ~ str_c(GoverningState ,"." ,GoverningClass.x)
+                                ,(str_detect(GoverningClass.x ,pattern = "-")) ~ str_c(GoverningState ,"." ,str_sub(GoverningClass.x ,start = 1 ,end = str_locate(GoverningClass.x ,pattern = "-")[ ,"start"]-1)))
+        ) %>%
+  left_join(ClassCodeLookups ,by = c("StateClass" = "StateAbbrClassCode")) %>%
+  mutate(MonthlyAge                                   = AgeFunction(ymd(DateEffective) ,ymd(DateExpiration) ,ymd(EvaluationDate) ,.5)
+         ,TrimesterAge                                = AgeFunction(ymd(DateEffective) ,ymd(DateExpiration) ,ymd(EvaluationDate) ,2)
+         ,PolicyYear                                  = as.character(year(DateEffective))
+         ,PolicyMonth                                 = str_pad(month(DateEffective) ,width = 2 ,side = "left" ,pad = "0")
+         ,PolicyYearMonth                             = str_c(PolicyYear ," - " ,PolicyMonth)
+         ,`WC:Rating:Output_reinsuranceExpenseFactor` = as.numeric(`WC:Rating:Output_reinsuranceExpenseFactor`)
+         ,CaVsNonCa                                   = factor(ifelse(toupper(GoverningState) == "CA" ,"CA" ,"Non-CA") ,levels = c("CA" ,"Non-CA"))
+         ,SingleStateVsMultiState                     = factor(ifelse(toupper(StateCount) == 1 ,"Single State" ,"Multi State") ,levels = c("Single State" ,"Multi State"))
+         ,Hub                                         = factor(Hub ,levels = HubLevels)
+         ,UwName                                      = str_c(UWName_First ," " ,UWName_Last)
+         ,KMinusXRatio                                = as.numeric(`WC:Rating:Output_frequencyToPremiumRatio`) - as.numeric(`WC:Rating:Output_rateAdequacyRatio`)
+         ,CalcXmodMinusXmod                           = as.numeric(CalcExperienceModifierPercentage) - as.numeric(`WC:Rating:Supplemental State Weighted Xmods_stWtdXmodExpiring`) / 100
+         ,CalcCombinedRatio                           = 1 - UnderwritingIncomePercentage
+         ,BoundPremiumBand                            = cut(as.numeric(BoundPremium) ,breaks = PremiumBreaks ,labels = LabelFunction(PremiumBreaks) ,right = FALSE)
+         ,XmodBand                                    = cut(as.numeric(`WC:Rating:Supplemental State Weighted Xmods_stWtdXmodExpiring`) / 100, breaks = XmodBreaks, labels = LabelFunction(XmodBreaks ,DecimalPlaces = 2) ,right = FALSE)
+         ,CalcCombinedRatioBand                       = cut(as.numeric(CalcCombinedRatio), breaks = CombinedRatioBreaks, labels = LabelFunction(CombinedRatioBreaks, DecimalPlaces = 2) ,right = FALSE)
+         ,CommissionBand                              = cut(as.numeric(`WC:Rating:Output_commission`) ,breaks = CommissionBreaks ,labels = LabelFunction(CommissionBreaks) ,right = FALSE)
+         ,ClassFitBugsScoreBand                       = cut(as.numeric(`WC:Rating:Output_classFitBugsScore`) ,breaks = ClassFitBugsBreaks ,labels = LabelFunction(ClassFitBugsBreaks) ,right = FALSE)
+         ,GeneralBugsScoreBand                        = cut(as.numeric(`WC:Rating:Output_generalBugsScore`) ,breaks = GeneralBugsBreaks ,labels = LabelFunction(GeneralBugsBreaks) ,right = FALSE)
+         ,KRatioBand                                  = cut(as.numeric(`WC:Rating:Output_frequencyToPremiumRatio`) ,breaks = KRatioBandBreaks ,labels = LabelFunction(KRatioBandBreaks) ,right = FALSE)
+         ,XRatioBand                                  = cut(as.numeric(`WC:Rating:Output_rateAdequacyRatio`) ,breaks = XRatioBandBreaks ,labels = LabelFunction(XRatioBandBreaks) ,right = FALSE)
+         ,KMinusXRatioBand                            = cut(as.numeric(KMinusXRatio) ,breaks = KMinusXRatioBandBreaks ,labels = LabelFunction(KMinusXRatioBandBreaks) ,right = FALSE)
+         ,RiskScoreBand                               = cut(as.numeric(`WC:Rating:Output_riskScore`), breaks = RiskScoreBreaks, labels = LabelFunction(RiskScoreBreaks, DecimalPlaces = 2) ,right = FALSE)
+         ,DeviationOffManualPremiumBand               = cut(as.numeric(`WC:Rating:Output_deviationOffOfManualPremium`) ,breaks = DeviationOffManualPremiumBreaks ,labels = LabelFunction(DeviationOffManualPremiumBreaks) ,right = FALSE)
+         ,CalcXmodMinusXmodBand                       = cut(as.numeric(CalcXmodMinusXmod), breaks = CalcXmodMinusXmodBandBreaks, labels = LabelFunction(CalcXmodMinusXmodBandBreaks, DecimalPlaces = 2) ,right = FALSE)
+         ,ClassDifferentialBand                       = cut(as.numeric(ClassDifferential), breaks = ClassDifferentialBreaks, labels = LabelFunction(ClassDifferentialBreaks, DecimalPlaces = 2) ,right = FALSE)
+         ,HazardGroupBand                             = cut(as.numeric(`WC:Rating:Output_hazardGroup`), breaks = HazardGroupBreaks, labels = LabelFunction(HazardGroupBreaks) ,right = TRUE)
+         ,HazardGroupBand                             = ifelse(HazardGroupBand == "2) 2 - 7" ,"2) 3 - 7" ,"1) 1 - 2")         
+         ,LimitedFinalLossEstimate                    = UnderwriterLossPickAmt + LayerLossPickAmt
+         ,APrioriLossRatio                            = ifelse(BoundCount == 1 ,LimitedFinalLossEstimate / BoundPremium ,NA)
+         ) %>%
+  left_join(ReserveTemplateLers ,by = c("HazardGroupNumber" = "HazardGroup" ,"GoverningState" = "State")) %>%
+  left_join(AverageLers ,by = c("HazardGroupNumber" = "HazardGroup")) %>%
+  left_join(OlfData ,by = c("PolicyYear" ,"PolicyMonth" ,"GoverningState" = "State")) %>%
+  left_join(InterpolatedReservingLossLdfs ,by = c("MonthlyAge" = "Age" ,"GoverningState" = "State")) %>%
+  left_join(AverageInterpolatedLossLdfs ,by = c("MonthlyAge" = "Age")) %>%
+  left_join(InterpolatedReservingAlaeLdfs ,by = c("TrimesterAge" = "Age" ,"GoverningState" = "State")) %>%
+  left_join(AverageInterpolatedAlaeLdfs ,by = c("TrimesterAge" = "Age")) %>%
+  rename(WC_Rating_Output_reinsuranceExpenseFactor = `WC:Rating:Output_reinsuranceExpenseFactor`) %>%
+  add_shadow(WC_Rating_Output_reinsuranceExpenseFactor ,MedicalOnlyLoadPercentage ,ALAELoadPercentage ,APrioriLossRatio ,HazardGroupTemperedLer200k ,HazardGroupTemperedLer1m) %>%
+  impute_lm(WC_Rating_Output_reinsuranceExpenseFactor ~ CaVsNonCa + Hub) %>%
+  impute_lm(MedicalOnlyLoadPercentage ~ CaVsNonCa + Hub) %>%
+  impute_lm(ALAELoadPercentage ~ CaVsNonCa + Hub) %>%
+  impute_lm(APrioriLossRatio ~ CaVsNonCa + Hub) %>%
+  impute_median(WC_Rating_Output_reinsuranceExpenseFactor ~ Hub) %>%
+  impute_median(MedicalOnlyLoadPercentage ~ Hub) %>%
+  impute_median(ALAELoadPercentage ~ Hub) %>%
+  impute_median(APrioriLossRatio ~ Hub) %>%
+  impute_median(HazardGroupTemperedLer200k ~ Hub) %>%
+  impute_median(HazardGroupTemperedLer1m ~ Hub) %>%
+  mutate(LimitedFinalLossEstimate                   = ifelse(BoundCount == 1 ,BoundPremium * APrioriLossRatio ,NA)
+         ,WC_Rating_Output_reinsuranceExpenseFactor = ifelse(WC_Rating_Output_reinsuranceExpenseFactor_NA == "NA" & WC_Rating_Output_reinsuranceExpenseFactor < MinReinsuranceExpense ,MinReinsuranceExpense ,ifelse(WC_Rating_Output_reinsuranceExpenseFactor_NA == "NA" & WC_Rating_Output_reinsuranceExpenseFactor > MaxReinsuranceExpense ,MaxReinsuranceExpense ,WC_Rating_Output_reinsuranceExpenseFactor))
+         ,MedicalOnlyLoadPercentage                 = ifelse(MedicalOnlyLoadPercentage_NA == "NA" & MedicalOnlyLoadPercentage < MinMedicalOnlyLoad ,MinMedicalOnlyLoad ,ifelse(MedicalOnlyLoadPercentage_NA == "NA" & MedicalOnlyLoadPercentage > MaxMedicalOnlyLoad ,MaxMedicalOnlyLoad ,MedicalOnlyLoadPercentage))
+         ,ALAELoadPercentage                        = ifelse(ALAELoadPercentage_NA == "NA" & ALAELoadPercentage < MinAlaeLoad ,MinAlaeLoad ,ifelse(ALAELoadPercentage_NA == "NA" & ALAELoadPercentage > MaxAlaeLoad ,MaxAlaeLoad ,ALAELoadPercentage))
+         ,PercentEarned                             = EarnedPercent(ymd(DateEffective) ,ymd(DateExpiration) ,ymd(EvaluationDate))
+         ,EarnedPayroll                             = PayrollAmt * PercentEarned
+         ,EarnedBoundPremium                        = BoundPremium * PercentEarned
+         ,WageAdjPayroll                            = PayrollAmt * coalesce(SawwLevel, 1)
+         ,WageAdjBoundPremium                       = BoundPremium * coalesce(SawwLevel, 1)
+         ,EarnedWageAdjPayroll                      = WageAdjPayroll * PercentEarned
+         ,EarnedWageAdjBoundPremium                 = WageAdjBoundPremium * PercentEarned
+         ,NetWageAdjAuditedEapExclDiv               = WageAdjBoundPremium * (1 - WC_Rating_Output_reinsuranceExpenseFactor)
+         ,NetEarnedWageAdjAuditedEapExclDiv         = NetWageAdjAuditedEapExclDiv * PercentEarned
+         ,FirstVsRest                               = ifelse(day(DateEffective) == 1 ,"First of Month" ,"Rest of Month")
+         ,XldpMedOnlyLoad                           = 1 + MedicalOnlyLoadPercentage
+         ,XldpAlaeLoad                              = 1 + ALAELoadPercentage
+         ,ConversionFactor1mTo200k                  = (1 - coalesce(TemperedLer200k ,HazardGroupTemperedLer200k)) / (1 - coalesce(TemperedLer1m ,HazardGroupTemperedLer1m))
+         ,ConversionFactor200kToUnlim               = 1 / (1 - coalesce(TemperedLer200k ,HazardGroupTemperedLer200k))
+         ,ConversionFactor1mToUnlim                 = 1 / (1 - coalesce(TemperedLer1m ,HazardGroupTemperedLer1m))
+         ,ExpectedIndemnityLossLimited200k          = LimitedFinalLossEstimate * ConversionFactor1mTo200k / (XldpAlaeLoad * XldpMedOnlyLoad)
+         ,ExpectedMedOnlyLossLimited200k            = (XldpMedOnlyLoad - 1) * ExpectedIndemnityLossLimited200k
+         ,ExpectedAlaeLimited200k                   = (XldpAlaeLoad - 1) * (ExpectedIndemnityLossLimited200k + ExpectedMedOnlyLossLimited200k)
+         ,ExpectedIndemnityLossLimited1m            = LimitedFinalLossEstimate / (XldpAlaeLoad * XldpMedOnlyLoad)
+         ,ExpectedMedOnlyLossLimited1m              = (XldpMedOnlyLoad - 1) * ExpectedIndemnityLossLimited1m
+         ,ExpectedAlaeLimited1m                     = (XldpAlaeLoad - 1) * (ExpectedIndemnityLossLimited1m + ExpectedMedOnlyLossLimited1m)
+         ,ExpectedIndemnityLossUnlim                = LimitedFinalLossEstimate * ConversionFactor1mToUnlim / (XldpAlaeLoad * XldpMedOnlyLoad)
+         ,ExpectedMedOnlyLossUnlim                  = (XldpMedOnlyLoad - 1) * ExpectedIndemnityLossUnlim
+         ,ExpectedAlaeUnlim                         = (XldpAlaeLoad - 1) * (ExpectedIndemnityLossUnlim + ExpectedMedOnlyLossUnlim)
+         ) %>%
+  left_join(PolicyLevelClaims ,by = c("policy_number" = "PolicyNumber")) %>%
+  mutate(UltimateMedOnlyIncurredLossCl               = coalesce(MedOnlyIncurredLoss ,0) * coalesce(InterpolatedIncurredMedOnlyCdf ,AvgInterpolatedIncurredMedOnlyCdf)
+         ,UltimatePaidAlaeCl                         = coalesce(PaidAlae ,0) * coalesce(InterpolatedPaidAlaeCdf ,AvgInterpolatedPaidAlaeCdf)
+         ,UltimateIndemnityPaidLossCl                = coalesce(IndemnityPaidLoss ,0) * coalesce(InterpolatedPaidLossCdf ,AvgInterpolatedPaidLossCdf)
+         ,UltimatePaidLossCl                         = UltimateIndemnityPaidLossCl + UltimateMedOnlyIncurredLossCl
+         ,UltimatePaidLossAndAlaeCl                  = UltimateIndemnityPaidLossCl + UltimateMedOnlyIncurredLossCl + UltimatePaidAlaeCl
+         ,UltimateIndemnityIncurredLossCl            = coalesce(IndemnityIncurredLoss ,0) * coalesce(InterpolatedIncurredLossCdf ,AvgInterpolatedIncurredLossCdf)
+         ,UltimateIncurredLossCl                     = UltimateIndemnityIncurredLossCl + UltimateMedOnlyIncurredLossCl
+         ,UltimateIncurredLossAndAlaeCl              = UltimateIndemnityIncurredLossCl + UltimateMedOnlyIncurredLossCl + UltimatePaidAlaeCl
+
+         ,UltimateMedOnlyIncurredLossBf              = coalesce(MedOnlyIncurredLoss ,0) + (1 - coalesce(InterpolatedIncurredMedOnlyPercentRptd ,AvgInterpolatedIncurredMedOnlyPercentRptd)) * ExpectedMedOnlyLossUnlim
+         ,UltimatePaidAlaeBf                         = coalesce(PaidAlae ,0) + (1 - coalesce(InterpolatedPaidAlaePercentRptd ,AvgInterpolatedPaidAlaePercentRptd)) * ExpectedAlaeUnlim
+         ,UltimateIndemnityPaidLossBf                = coalesce(IndemnityPaidLoss ,0) + (1 - coalesce(InterpolatedPaidLossPercentRptd ,AvgInterpolatedPaidLossPercentRptd)) * ExpectedIndemnityLossUnlim
+         ,UltimatePaidLossBf                         = UltimateIndemnityPaidLossBf + UltimateMedOnlyIncurredLossBf
+         ,UltimatePaidLossAndAlaeBf                  = UltimateIndemnityPaidLossBf + UltimateMedOnlyIncurredLossBf + UltimatePaidAlaeBf
+         ,UltimateIndemnityIncurredLossBf            = coalesce(IndemnityIncurredLoss ,0) + (1 - coalesce(InterpolatedIncurredLossPercentRptd ,AvgInterpolatedIncurredLossPercentRptd)) * ExpectedIndemnityLossUnlim
+         ,UltimateIncurredLossBf                     = UltimateIndemnityIncurredLossBf + UltimateMedOnlyIncurredLossBf
+         ,UltimateIncurredLossAndAlaeBf              = UltimateIndemnityIncurredLossBf + UltimateMedOnlyIncurredLossBf + UltimatePaidAlaeBf
+
+         ,UltimateMedOnlyIncurredLossGb              = coalesce(MedOnlyIncurredLoss ,0) + (1 - coalesce(InterpolatedIncurredMedOnlyPercentRptd ,AvgInterpolatedIncurredMedOnlyPercentRptd)) * UltimateMedOnlyIncurredLossBf
+         ,UltimatePaidAlaeGb                         = coalesce(PaidAlae ,0) + (1 - coalesce(InterpolatedPaidAlaePercentRptd ,AvgInterpolatedPaidAlaePercentRptd)) * UltimatePaidAlaeBf
+         ,UltimateIndemnityPaidLossGb                = coalesce(IndemnityPaidLoss ,0) + (1 - coalesce(InterpolatedPaidLossPercentRptd ,AvgInterpolatedPaidLossPercentRptd)) * UltimateIndemnityPaidLossBf
+         ,UltimatePaidLossGb                         = UltimateIndemnityPaidLossGb + UltimateMedOnlyIncurredLossGb
+         ,UltimatePaidLossAndAlaeGb                  = UltimateIndemnityPaidLossGb + UltimateMedOnlyIncurredLossGb + UltimatePaidAlaeGb
+         ,UltimateIndemnityIncurredLossGb            = coalesce(IndemnityIncurredLoss ,0) + (1 - coalesce(InterpolatedIncurredLossPercentRptd ,AvgInterpolatedIncurredLossPercentRptd)) * UltimateIndemnityIncurredLossBf
+         ,UltimateIncurredLossGb                     = UltimateIndemnityIncurredLossGb + UltimateMedOnlyIncurredLossGb
+         ,UltimateIncurredLossAndAlaeGb              = UltimateIndemnityIncurredLossGb + UltimateMedOnlyIncurredLossGb + UltimatePaidAlaeGb
+
+         ,UltimateCappedMedOnlyIncurredLossCl        = coalesce(CappedMedOnlyIncurredLoss ,0) * coalesce(InterpolatedIncurredMedOnlyCdf ,AvgInterpolatedIncurredMedOnlyCdf)
+         ,UltimateCappedPaidAlaeCl                   = coalesce(CappedPaidAlae ,0) * coalesce(InterpolatedPaidAlaeCdf ,AvgInterpolatedPaidAlaeCdf)
+         ,UltimateCappedIndemnityPaidLossCl          = coalesce(CappedIndemnityPaidLoss ,0) * coalesce(InterpolatedPaidLossCdf ,AvgInterpolatedPaidLossCdf)
+         ,UltimateCappedPaidLossCl                   = UltimateCappedIndemnityPaidLossCl + UltimateCappedMedOnlyIncurredLossCl
+         ,UltimateCappedPaidLossAndAlaeCl            = UltimateCappedIndemnityPaidLossCl + UltimateCappedMedOnlyIncurredLossCl + UltimateCappedPaidAlaeCl
+         ,UltimateCappedIndemnityIncurredLossCl      = coalesce(CappedIndemnityIncurredLoss ,0) * coalesce(InterpolatedIncurredLossCdf ,AvgInterpolatedIncurredLossCdf)
+         ,UltimateCappedIncurredLossCl               = UltimateCappedIndemnityIncurredLossCl + UltimateCappedMedOnlyIncurredLossCl
+         ,UltimateCappedIncurredLossAndAlaeCl        = UltimateCappedIndemnityIncurredLossCl + UltimateCappedMedOnlyIncurredLossCl + UltimateCappedPaidAlaeCl
+
+         ,UltimateCappedMedOnlyIncurredLossBf        = coalesce(CappedMedOnlyIncurredLoss ,0) + (1 - coalesce(InterpolatedIncurredMedOnlyPercentRptd ,AvgInterpolatedIncurredMedOnlyPercentRptd)) * ExpectedMedOnlyLossUnlim
+         ,UltimateCappedPaidAlaeBf                   = coalesce(CappedPaidAlae ,0) + (1 - coalesce(InterpolatedPaidAlaePercentRptd ,AvgInterpolatedPaidAlaePercentRptd)) * ExpectedAlaeLimited1m
+         ,UltimateCappedIndemnityPaidLossBf          = coalesce(CappedIndemnityPaidLoss ,0) + (1 - coalesce(InterpolatedPaidLossPercentRptd ,AvgInterpolatedPaidLossPercentRptd)) * ExpectedIndemnityLossLimited200k
+         ,UltimateCappedPaidLossBf                   = UltimateCappedIndemnityPaidLossBf + UltimateCappedMedOnlyIncurredLossBf
+         ,UltimateCappedPaidLossAndAlaeBf            = UltimateCappedIndemnityPaidLossBf + UltimateCappedMedOnlyIncurredLossBf + UltimateCappedPaidAlaeBf
+         ,UltimateCappedIndemnityIncurredLossBf      = coalesce(CappedIndemnityIncurredLoss ,0) + (1 - coalesce(InterpolatedIncurredLossPercentRptd ,AvgInterpolatedIncurredLossPercentRptd)) * ExpectedIndemnityLossLimited200k
+         ,UltimateCappedIncurredLossBf               = UltimateCappedIndemnityIncurredLossBf + UltimateCappedMedOnlyIncurredLossBf
+         ,UltimateCappedIncurredLossAndAlaeBf        = UltimateCappedIndemnityIncurredLossBf + UltimateCappedMedOnlyIncurredLossBf + UltimateCappedPaidAlaeBf
+
+         ,UltimateCappedMedOnlyIncurredLossGb        = coalesce(CappedMedOnlyIncurredLoss ,0) + (1 - coalesce(InterpolatedIncurredMedOnlyPercentRptd ,AvgInterpolatedIncurredMedOnlyPercentRptd)) * UltimateCappedMedOnlyIncurredLossBf
+         ,UltimateCappedPaidAlaeGb                   = coalesce(CappedPaidAlae ,0) + (1 - coalesce(InterpolatedPaidAlaePercentRptd ,AvgInterpolatedPaidAlaePercentRptd)) * UltimateCappedPaidAlaeBf
+         ,UltimateCappedIndemnityPaidLossGb          = coalesce(CappedIndemnityPaidLoss ,0) + (1 - coalesce(InterpolatedPaidLossPercentRptd ,AvgInterpolatedPaidLossPercentRptd)) * UltimateCappedIndemnityPaidLossBf
+         ,UltimateCappedPaidLossGb                   = UltimateCappedIndemnityPaidLossGb + UltimateCappedMedOnlyIncurredLossGb
+         ,UltimateCappedPaidLossAndAlaeGb            = UltimateCappedIndemnityPaidLossGb + UltimateCappedMedOnlyIncurredLossGb + UltimateCappedPaidAlaeGb
+         ,UltimateCappedIndemnityIncurredLossGb      = coalesce(CappedIndemnityIncurredLoss ,0) + (1 - coalesce(InterpolatedIncurredLossPercentRptd ,AvgInterpolatedIncurredLossPercentRptd)) * UltimateCappedIndemnityIncurredLossBf
+         ,UltimateCappedIncurredLossGb               = UltimateCappedIndemnityIncurredLossGb + UltimateCappedMedOnlyIncurredLossGb
+         ,UltimateCappedIncurredLossAndAlaeGb        = UltimateCappedIndemnityIncurredLossGb + UltimateCappedMedOnlyIncurredLossGb + UltimateCappedPaidAlaeGb
+
+         ,UltimateOnlvlMedOnlyIncurredLossCl         = coalesce(OnlvlMedOnlyIncurredLoss ,0) * coalesce(InterpolatedIncurredMedOnlyCdf ,AvgInterpolatedIncurredMedOnlyCdf)
+         ,UltimateOnlvlPaidAlaeCl                    = coalesce(OnlvlPaidAlae ,0) * coalesce(InterpolatedPaidAlaeCdf ,AvgInterpolatedPaidAlaeCdf)
+         ,UltimateOnlvlIndemnityPaidLossCl           = coalesce(OnlvlIndemnityPaidLoss ,0) * coalesce(InterpolatedPaidLossCdf ,AvgInterpolatedPaidLossCdf)
+         ,UltimateOnlvlPaidLossCl                    = UltimateOnlvlIndemnityPaidLossCl + UltimateOnlvlMedOnlyIncurredLossCl
+         ,UltimateOnlvlPaidLossAndAlaeCl             = UltimateOnlvlIndemnityPaidLossCl + UltimateOnlvlMedOnlyIncurredLossCl + UltimateOnlvlPaidAlaeCl
+         ,UltimateOnlvlIndemnityIncurredLossCl       = coalesce(OnlvlIndemnityIncurredLoss ,0) * coalesce(InterpolatedIncurredLossCdf ,AvgInterpolatedIncurredLossCdf)
+         ,UltimateOnlvlIncurredLossCl                = UltimateOnlvlIndemnityIncurredLossCl + UltimateOnlvlMedOnlyIncurredLossCl
+         ,UltimateOnlvlIncurredLossAndAlaeCl         = UltimateOnlvlIndemnityIncurredLossCl + UltimateOnlvlMedOnlyIncurredLossCl + UltimateOnlvlPaidAlaeCl
+
+         ,UltimateOnlvlMedOnlyIncurredLossBf         = coalesce(OnlvlMedOnlyIncurredLoss ,0) + (1 - coalesce(InterpolatedIncurredMedOnlyPercentRptd ,AvgInterpolatedIncurredMedOnlyPercentRptd)) * ExpectedMedOnlyLossUnlim
+         ,UltimateOnlvlPaidAlaeBf                    = coalesce(OnlvlPaidAlae ,0) + (1 - coalesce(InterpolatedPaidAlaePercentRptd ,AvgInterpolatedPaidAlaePercentRptd)) * ExpectedAlaeUnlim
+         ,UltimateOnlvlIndemnityPaidLossBf           = coalesce(OnlvlIndemnityPaidLoss ,0) + (1 - coalesce(InterpolatedPaidLossPercentRptd ,AvgInterpolatedPaidLossPercentRptd)) * ExpectedIndemnityLossUnlim
+         ,UltimateOnlvlPaidLossBf                    = UltimateOnlvlIndemnityPaidLossBf + UltimateOnlvlMedOnlyIncurredLossBf
+         ,UltimateOnlvlPaidLossAndAlaeBf             = UltimateOnlvlIndemnityPaidLossBf + UltimateOnlvlMedOnlyIncurredLossBf + UltimateOnlvlPaidAlaeBf
+         ,UltimateOnlvlIndemnityIncurredLossBf       = coalesce(OnlvlIndemnityIncurredLoss ,0) + (1 - coalesce(InterpolatedIncurredLossPercentRptd ,AvgInterpolatedIncurredLossPercentRptd)) * ExpectedIndemnityLossUnlim
+         ,UltimateOnlvlIncurredLossBf                = UltimateOnlvlIndemnityIncurredLossBf + UltimateOnlvlMedOnlyIncurredLossBf
+         ,UltimateOnlvlIncurredLossAndAlaeBf         = UltimateOnlvlIndemnityIncurredLossBf + UltimateOnlvlMedOnlyIncurredLossBf + UltimateOnlvlPaidAlaeBf
+
+         ,UltimateOnlvlMedOnlyIncurredLossGb         = coalesce(OnlvlMedOnlyIncurredLoss ,0) + (1 - coalesce(InterpolatedIncurredMedOnlyPercentRptd ,AvgInterpolatedIncurredMedOnlyPercentRptd)) * UltimateOnlvlMedOnlyIncurredLossBf
+         ,UltimateOnlvlPaidAlaeGb                    = coalesce(OnlvlPaidAlae ,0) + (1 - coalesce(InterpolatedPaidAlaePercentRptd ,AvgInterpolatedPaidAlaePercentRptd)) * UltimateOnlvlPaidAlaeBf
+         ,UltimateOnlvlIndemnityPaidLossGb           = coalesce(OnlvlIndemnityPaidLoss ,0) + (1 - coalesce(InterpolatedPaidLossPercentRptd ,AvgInterpolatedPaidLossPercentRptd)) * UltimateOnlvlIndemnityPaidLossBf
+         ,UltimateOnlvlPaidLossGb                    = UltimateOnlvlIndemnityPaidLossGb + UltimateOnlvlMedOnlyIncurredLossGb
+         ,UltimateOnlvlPaidLossAndAlaeGb             = UltimateOnlvlIndemnityPaidLossGb + UltimateOnlvlMedOnlyIncurredLossGb + UltimateOnlvlPaidAlaeGb
+         ,UltimateOnlvlIndemnityIncurredLossGb       = coalesce(OnlvlIndemnityIncurredLoss ,0) + (1 - coalesce(InterpolatedIncurredLossPercentRptd ,AvgInterpolatedIncurredLossPercentRptd)) * UltimateOnlvlIndemnityIncurredLossBf
+         ,UltimateOnlvlIncurredLossGb                = UltimateOnlvlIndemnityIncurredLossGb + UltimateOnlvlMedOnlyIncurredLossGb
+         ,UltimateOnlvlIncurredLossAndAlaeGb         = UltimateOnlvlIndemnityIncurredLossGb + UltimateOnlvlMedOnlyIncurredLossGb + UltimateOnlvlPaidAlaeGb
+
+         ,UltimateCappedOnlvlMedOnlyIncurredLossCl   = coalesce(CappedOnlvlMedOnlyIncurredLoss ,0) * coalesce(InterpolatedIncurredMedOnlyCdf ,AvgInterpolatedIncurredMedOnlyCdf)
+         ,UltimateCappedOnlvlPaidAlaeCl              = coalesce(CappedOnlvlPaidAlae ,0) * coalesce(InterpolatedPaidAlaeCdf ,AvgInterpolatedPaidAlaeCdf)
+         ,UltimateCappedOnlvlIndemnityPaidLossCl     = coalesce(CappedOnlvlIndemnityPaidLoss ,0) * coalesce(InterpolatedPaidLossCdf ,AvgInterpolatedPaidLossCdf)
+         ,UltimateCappedOnlvlPaidLossCl              = UltimateCappedOnlvlIndemnityPaidLossCl + UltimateCappedOnlvlMedOnlyIncurredLossCl
+         ,UltimateCappedOnlvlPaidLossAndAlaeCl       = UltimateCappedOnlvlIndemnityPaidLossCl + UltimateCappedOnlvlMedOnlyIncurredLossCl + UltimateCappedOnlvlPaidAlaeCl
+         ,UltimateCappedOnlvlIndemnityIncurredLossCl = coalesce(CappedOnlvlIndemnityIncurredLoss ,0) * coalesce(InterpolatedIncurredLossCdf ,AvgInterpolatedIncurredLossCdf)
+         ,UltimateCappedOnlvlIncurredLossCl          = UltimateCappedOnlvlIndemnityIncurredLossCl + UltimateCappedOnlvlMedOnlyIncurredLossCl
+         ,UltimateCappedOnlvlIncurredLossAndAlaeCl   = UltimateCappedOnlvlIndemnityIncurredLossCl + UltimateCappedOnlvlMedOnlyIncurredLossCl + UltimateCappedOnlvlPaidAlaeCl
+
+         ,UltimateCappedOnlvlMedOnlyIncurredLossBf   = coalesce(CappedOnlvlMedOnlyIncurredLoss ,0) + (1 - coalesce(InterpolatedIncurredMedOnlyPercentRptd ,AvgInterpolatedIncurredMedOnlyPercentRptd)) * ExpectedMedOnlyLossUnlim
+         ,UltimateCappedOnlvlPaidAlaeBf              = coalesce(CappedOnlvlPaidAlae ,0) + (1 - coalesce(InterpolatedPaidAlaePercentRptd ,AvgInterpolatedPaidAlaePercentRptd)) * ExpectedAlaeLimited1m
+         ,UltimateCappedOnlvlIndemnityPaidLossBf     = coalesce(CappedOnlvlIndemnityPaidLoss ,0) + (1 - coalesce(InterpolatedPaidLossPercentRptd ,AvgInterpolatedPaidLossPercentRptd)) * ExpectedIndemnityLossLimited200k
+         ,UltimateCappedOnlvlPaidLossBf              = UltimateCappedOnlvlIndemnityPaidLossBf + UltimateCappedOnlvlMedOnlyIncurredLossBf
+         ,UltimateCappedOnlvlPaidLossAndAlaeBf       = UltimateCappedOnlvlIndemnityPaidLossBf + UltimateCappedOnlvlMedOnlyIncurredLossBf + UltimateCappedOnlvlPaidAlaeBf
+         ,UltimateCappedOnlvlIndemnityIncurredLossBf = coalesce(CappedOnlvlIndemnityIncurredLoss ,0) + (1 - coalesce(InterpolatedIncurredLossPercentRptd ,AvgInterpolatedIncurredLossPercentRptd)) * ExpectedIndemnityLossLimited200k
+         ,UltimateCappedOnlvlIncurredLossBf          = UltimateCappedOnlvlIndemnityIncurredLossBf + UltimateCappedOnlvlMedOnlyIncurredLossBf
+         ,UltimateCappedOnlvlIncurredLossAndAlaeBf   = UltimateCappedOnlvlIndemnityIncurredLossBf + UltimateCappedOnlvlMedOnlyIncurredLossBf + UltimateCappedOnlvlPaidAlaeBf
+
+         ,UltimateCappedOnlvlMedOnlyIncurredLossGb   = coalesce(CappedOnlvlMedOnlyIncurredLoss ,0) + (1 - coalesce(InterpolatedIncurredMedOnlyPercentRptd ,AvgInterpolatedIncurredMedOnlyPercentRptd)) * UltimateCappedOnlvlMedOnlyIncurredLossBf
+         ,UltimateCappedOnlvlPaidAlaeGb              = coalesce(CappedOnlvlPaidAlae ,0) + (1 - coalesce(InterpolatedPaidAlaePercentRptd ,AvgInterpolatedPaidAlaePercentRptd)) * UltimateCappedOnlvlPaidAlaeBf
+         ,UltimateCappedOnlvlIndemnityPaidLossGb     = coalesce(CappedOnlvlIndemnityPaidLoss ,0) + (1 - coalesce(InterpolatedPaidLossPercentRptd ,AvgInterpolatedPaidLossPercentRptd)) * UltimateCappedOnlvlIndemnityPaidLossBf
+         ,UltimateCappedOnlvlPaidLossGb              = UltimateCappedOnlvlIndemnityPaidLossGb + UltimateCappedOnlvlMedOnlyIncurredLossGb
+         ,UltimateCappedOnlvlPaidLossAndAlaeGb       = UltimateCappedOnlvlIndemnityPaidLossGb + UltimateCappedOnlvlMedOnlyIncurredLossGb + UltimateCappedOnlvlPaidAlaeGb
+         ,UltimateCappedOnlvlIndemnityIncurredLossGb = coalesce(CappedOnlvlIndemnityIncurredLoss ,0) + (1 - coalesce(InterpolatedIncurredLossPercentRptd ,AvgInterpolatedIncurredLossPercentRptd)) * UltimateCappedOnlvlIndemnityIncurredLossBf
+         ,UltimateCappedOnlvlIncurredLossGb          = UltimateCappedOnlvlIndemnityIncurredLossGb + UltimateCappedOnlvlMedOnlyIncurredLossGb
+         ,UltimateCappedOnlvlIncurredLossAndAlaeGb   = UltimateCappedOnlvlIndemnityIncurredLossGb + UltimateCappedOnlvlMedOnlyIncurredLossGb + UltimateCappedOnlvlPaidAlaeGb
+
+         ,SelectedUnlimUltimateLossAndAlae           = UltimateIncurredLossAndAlaeBf * PercentEarned
+         ,SelectedUnlimUltimateOnlvlLossAndAlae      = UltimateOnlvlIncurredLossAndAlaeBf * PercentEarned
+         ,SelectedCappedUltimateLossAndAlae          = UltimateCappedIncurredLossAndAlaeBf * PercentEarned
+         ,SelectedCappedUltimateOnlvlLossAndAlae     = UltimateCappedOnlvlIncurredLossAndAlaeBf * PercentEarned
+  ) %>%
+## Using Bound Premium instead of EAP at issuance, EAP at issuance is what is used in Rate Change Report
+  left_join(CTRLookups ,by = c("policy_number" = "SymPolMod")) %>%
+  mutate( Total_CTR                                  = (BoundPremium * (Rate_Mod - 1)/Rate_Mod)
+  )
+
+## Removing unneccessary datasets to increase performance
+rm(list=setdiff(ls(), c("FinalAlteryxData" ,"SubmissionsWithTriaInfo" ,"PolicyLevelClaims" ,"InterpolatedReservingLossLdfs" ,"InterpolatedReservingAlaeLdfs" ,"AverageInterpolatedLossLdfs" ,"AverageInterpolatedAlaeLdfs" ,"SnapFieldsFinal" ,"FinalXldpWarehouseData" ,"OlfData" ,"ReserveTemplateLers" ,"AverageLers" ,"EvaluationDate" ,"CombinedDataset" ,"InforceDateRange" ,"AvgTemperedLer200k" ,"AvgTemperedLer1m" ,"ClassCodeLookups")))
+
+#####################################################################################
+## Expiring Information --New Section
+#####################################################################################
+
+## Should also add in an InforceIndicator flag to the dataset
+## In addition to all the Expiring columns
+myconn <- odbcConnect("BI_SNAP_WC_Daily")
+
+RawExpiringPolicyNumber <- sqlQuery(myconn ,"
+Select
+ submission_number
+ ,ExpiringPolicyNumber = rtrim(ltrim(expiring_policy_number))
+From SNAP_WC_Daily.dbo.submission
+Where effective_date >= Concat(Year(GetDate()) - 7, '-12-31')
+  and submission_number Is Not Null 
+  and expiring_policy_number is not null
+  and rtrim(ltrim(expiring_policy_number)) <> ''
+Order By 1 ,2
+")
+
+close(myconn)
+
+RawExpiringPolicyNumber <- as_tibble(RawExpiringPolicyNumber)
+
+CombinedDataset <- CombinedDataset %>%
+  left_join(RawExpiringPolicyNumber ,by = c("Quote_ID" = "submission_number"))
+
+SelectedExpiringSegments <- NULL
+
+SelectedExpiringSegments <- c(
+  "policy_number"
+  ,"branch"
+  ,"Quote_ID"
+  ,"proposal_number"
+  ,"DateEffective"
+  ,"BoundPremium"
+  ,"agency_code"
+  ,"renewal_flag"
+  ,"Producer"
+  ,"IQ_Type"
+  ,"GoverningState"
+  ,"GoverningClass.x"
+  ,"StateCount"
+  ,"bdu"
+  ,"ua"
+  ,"au"
+  ,"Hub"
+  ,"Region"
+  ,"AccidentInvestigationProgramYN"
+  ,"BillingTypeDirectOrAgency"
+  ,"CheckAuditsFrequencyName"
+  ,"DrugTestingYN"
+  ,"NumYrsInBusiness"
+  ,"ReturnToWorkProgramFIN"
+  ,"SafetyDirectorYN"
+  ,"SafetyIncentiveProgramYN"
+  ,"ClassSpecificBUGSScore"
+  ,"CommissionPercentage"
+  ,"GoverningClassColor"
+  ,"NetRateChangePercentage"
+  ,"DeviationOffOfManualPremiumPercentage"
+  ,"RateAdequacyRatioPercentage"
+  ,"XRatioPercentage"
+  ,"RiskScore"
+  ,"ExpiringCarrierName"
+  ,"WC:Rating:Input_ratedByXldp"
+  ,"WC:Rating:Input_pdRated"
+  ,"WC:Rating:Output_classColor"
+  ,"WC:Rating:Output_classFitBugsScore"
+  ,"WC:Rating:Output_generalBugsScore"
+  ,"GoverningClass.y"
+  ,"StateClass"
+  ,"ClassCodeDescription"
+  ,"IndustryGroup"
+  ,"BureauIndustryGroup"
+  ,"HazardGroupNumber"
+  ,"CaVsNonCa"
+  ,"SingleStateVsMultiState"
+  ,"FirstVsRest"
+  ,"PolicyMonth"
+  ,"KMinusXRatio"
+  ,"CalcXmodMinusXmod"
+  ,"BoundPremiumBand"
+  ,"XmodBand"
+  ,"CalcCombinedRatioBand"
+  ,"CommissionBand"
+  ,"ClassFitBugsScoreBand"
+  ,"GeneralBugsScoreBand"
+  ,"KRatioBand"
+  ,"XRatioBand"
+  ,"KMinusXRatioBand"
+  ,"RiskScoreBand"
+  ,"DeviationOffManualPremiumBand"
+  ,"CalcXmodMinusXmodBand"
+  ,"ClassDifferentialBand"
+  ,"HazardGroupBand"
+  ,"PrimaryStateCounty"
+  ,"InstantQuoteTierDescription"
+  ,"InstantQuoteRating"
+)
+
+ExpiringCombinedDataset <- CombinedDataset %>%
+  select(SelectedExpiringSegments)
+
+colnames(ExpiringCombinedDataset)[-1] <- str_c("Expiring" ,colnames(ExpiringCombinedDataset)[-1])
+
+FinalDataset <- CombinedDataset %>%
+  left_join(ExpiringCombinedDataset ,by = c("ExpiringPolicyNumber" = "policy_number") ,na_matches = "never") %>%
+  mutate(RunDate           = today()
+         ,Inforce          = as.numeric(InforceDateRange(DateEffective ,DateExpiration ,EvaluationDate) & BoundCount == 1)
+         ,InforceDateRange = as.numeric(InforceDateRange(DateEffective ,DateExpiration ,EvaluationDate))
+         ,isSubmission     = 1
+         ,isNbSubmission   = ifelse(renewal_flag == "New" ,1 ,0)
+         ,isRnSubmission   = ifelse(renewal_flag == "Renewal" ,1 ,0)
+         ,isQuote          = QuoteCount
+         ,isNbQuote        = ifelse(QuoteCount == 1 & renewal_flag == "New" ,1 ,0)
+         ,isRnQuote        = ifelse(QuoteCount == 1 & renewal_flag == "Renewal" ,1 ,0)
+         ,isBind           = BoundCount
+         ,isNbBind         = ifelse(BoundCount == 1 & renewal_flag == "New" ,1 ,0)
+         ,isRnBind         = ifelse(BoundCount == 1 & renewal_flag == "Renewal" ,1 ,0)
+         ,UpForRenewal     = ifelse(renewal_flag == "Renewal" & !is.na(ExpiringPolicyNumber) & InforceDateRange == 1 ,1 ,0)
+         ,Renewed          = ifelse(renewal_flag == "Renewal" & Inforce == 1 & !is.na(ExpiringPolicyNumber) ,1 ,0)
+         ) %>%
+  select(RunDate ,Inforce ,InforceDateRange ,everything()) %>%
+  filter(year(DateEffective) >= year(EvaluationDate) - 5)
+
+#####################################################################################
+## Output Datasets --Final Section
+#####################################################################################
+
+## Outputting to csv file
+# BasePath <- "//newfs5/EXCEL/ACTUARIA/ACTUARIAL/SubmissionDataset"
+# RunDate <- as.character(today())
+# MonthFolder <- as.character(today() - days(day(today())) + days(1))
+# DatalinkFilename <- str_c("Datalink Output --" ,RunDate ,".csv")
+# AlteryxFilename <- str_c("Alteryx Output --" ,RunDate ,".csv")
+# 
+# SavePath <- file.path(BasePath ,MonthFolder)
+# dir.create(SavePath ,showWarnings = FALSE)
+# 
+# fwrite(FinalDataset ,file = file.path(SavePath ,DatalinkFilename))
+# fwrite(FinalAlteryxData ,file = file.path(SavePath ,AlteryxFilename))
+
+
+#Saving current workspace as a backup for troubleshooting. Also save to excel file for backups.
+#Saving image works, but excel save doesn't.. might be too big for excel.
+#saveDataPath = "//newfs5/EXCEL/ACTUARIA/ACTUARIAL/SubmissionDataset/Data/"
+#saveDataName = paste("SubmissionDatasetAsOf",format(Sys.Date(), "%m%d%Y"), ".xlsx", sep="")
+#write_xlsx(FinalDataset, path = paste(saveDataPath,saveDataName,sep=""))
+savePath = "//newfs5/EXCEL/ACTUARIA/ACTUARIAL/SubmissionDataset/Code/RDATA/"
+saveName = paste("SubmissionDatasetAsOf",format(Sys.Date(), "%m%d%Y"), ".RDATA", sep="")
+save.image(file=paste(savePath,saveName,sep=""))
+
+
+##Outputting to SQL Table
+##For some reason you have to have an underscore in the name when saving to a non-default schema. Due to issue with odbc.
+##Also note that the default schema is not "dbo" but is ICWPDC-SD/rriesenb (or whatever your username is)
+myconn <- dbConnect(odbc::odbc(),
+                    driver = "SQL Server",
+                    database = "ActuarialPlayPantry",
+                    server = "DC1RPTDBDEV01")
+
+
+TableName <- DBI::Id(schema = "rrr"
+                     ,table  = "SubmissionMaster_WithDevelopedClaims")
+
+if (dbExistsTable(myconn, TableName)){
+  dbRemoveTable(myconn ,TableName)
+}
+
+# #Loop to load 50k rows at a time into SQL Table. Note; this code removes the current table. Also, this code fails due to SQL issues.
+# #Seems like the sql db connection isn't stable long enough to run the loop. Fails at different points. We'll have to brute force it for now.
+# numRows = nrow(FinalDataset)
+# numSets = floor(numRows/50000)
+# setRow = 0
+# for (i in 1:numSets){
+#   dbWriteTable(myconn ,name = TableName ,value = FinalDataset[setRow + 1:setRow + 50000,] ,row.names = FALSE, overwrite = FALSE, append = TRUE)
+#   setRow = setRow + 50000
+# }
+# dbWriteTable(myconn ,name = TableName ,value = FinalDataset[setRow + 1:nrow(FinalDataset),] ,row.names = FALSE, overwrite = FALSE, append = TRUE)
+
+
+##Old way: needed to load 50k rows at a time otherwise code would fail
+dbWriteTable(myconn ,name = TableName ,value = FinalDataset[1:50000,] ,row.names = FALSE ,overwrite = FALSE ,append = TRUE)
+dbWriteTable(myconn ,name = TableName ,value = FinalDataset[50001:100000,] ,row.names = FALSE ,overwrite = FALSE ,append = TRUE)
+dbWriteTable(myconn ,name = TableName ,value = FinalDataset[100001:150000,] ,row.names = FALSE ,overwrite = FALSE ,append = TRUE)
+dbWriteTable(myconn ,name = TableName ,value = FinalDataset[150001:200000,] ,row.names = FALSE ,overwrite = FALSE ,append = TRUE)
+dbWriteTable(myconn ,name = TableName ,value = FinalDataset[200001:250000,] ,row.names = FALSE ,overwrite = FALSE ,append = TRUE)
+dbWriteTable(myconn ,name = TableName ,value = FinalDataset[250001:300000,] ,row.names = FALSE ,overwrite = FALSE ,append = TRUE)
+dbWriteTable(myconn ,name = TableName ,value = FinalDataset[300001:350000,] ,row.names = FALSE ,overwrite = FALSE ,append = TRUE)
+dbWriteTable(myconn ,name = TableName ,value = FinalDataset[350001:400000,] ,row.names = FALSE ,overwrite = FALSE ,append = TRUE)
+dbWriteTable(myconn ,name = TableName ,value = FinalDataset[400001:450000,] ,row.names = FALSE ,overwrite = FALSE ,append = TRUE)
+dbWriteTable(myconn ,name = TableName ,value = FinalDataset[450001:nrow(FinalDataset),] ,row.names = FALSE , overwrite = FALSE ,append = TRUE)
+
+dbDisconnect(myconn)

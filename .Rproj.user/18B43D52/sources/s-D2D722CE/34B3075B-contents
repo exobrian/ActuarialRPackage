@@ -1,0 +1,1158 @@
+# list.of.packages <- c("RODBC", "DBI" ,"magrittr" ,"tidyverse" ,"zoo" ,"ggthemes" ,"lubridate" ,"readxl" ,"writexl" ,"openxlsx" ,"pdftools" ,"data.table" ,"broom")
+# new.packages <- list.of.packages[!(list.of.packages %in% installed.packages()[,"Package"])]
+# if(length(new.packages)) install.packages(new.packages)
+
+library(RODBC)
+library(DBI)
+library(magrittr)
+library(tidyverse)
+library(zoo)
+library(ggthemes)
+library(lubridate)
+library(readxl)
+library(writexl)
+library(openxlsx)
+library(naniar)
+library(simputation)
+library(pdftools)
+library(data.table)
+library(broom)
+library(stats)
+
+#####################################################################################
+## SNAP Input
+##
+#### This process replicates the SNAP Input part of the BDU Metrics Alteryx workflow
+#####################################################################################
+
+RawProposalOverrides <- read_xlsx("//DC1CFS01/Company/Ent Strategy and Analytics/PFP/Reports/Dashboard/PFP Overrides.xlsx" ,sheet = "Proposal Status Override")
+
+ProposalOverrides <- RawProposalOverrides %>%
+  rename(current_node_name = `New Status`)
+
+myconn <- odbcConnect("BI_SNAP_WC_Daily")
+
+AllProposalsSent <- sqlQuery(myconn ,"
+Select 
+ q.submission_id, 
+ q.ordinal_number, 
+ q.current_node_name, 
+ q.status, 
+ q.submit_date, 
+ q.sent_date, 
+ q.total_premium 
+From SNAP_WC_Daily.dbo.quote q 
+   Left Join SNAP_WC_Daily.dbo.submission s On q.submission_id = s.id 
+Where q.sent_date Is Not Null 
+  And s.effective_date >= Concat(Year(GetDate()) - 7, '-12-31') 
+Order By q.submission_id, q.submit_date
+")
+
+close(myconn)
+
+AllProposalsSent <- as_tibble(AllProposalsSent) %>%
+  mutate_if(is.factor ,as.character) %>%
+  mutate(sent_date    = force_tz(sent_date ,tzone = "GMT")
+         ,submit_date = force_tz(submit_date ,tzone = "GMT"))
+
+ProposalOverrides <- ProposalOverrides %>%
+  select(-c(Submission_Number ,Notes)) %>%
+  rename(submission_id   = Submission_ID
+         ,ordinal_number = `Proposal Number`
+         ,total_premium  = `Total Premium`) %>%
+  mutate(current_node_name = tolower(current_node_name))
+
+MissingProposalOverrides <- anti_join(ProposalOverrides ,AllProposalsSent ,by = c("submission_id" ,"ordinal_number"))
+OverlapProposalOverrides <- inner_join(ProposalOverrides ,AllProposalsSent ,by = c("submission_id" ,"ordinal_number"))
+ProposalsExcludingOverrides <- anti_join(AllProposalsSent ,ProposalOverrides ,by = c("submission_id" ,"ordinal_number"))
+
+OverlapProposalOverrides <- OverlapProposalOverrides %>%
+  mutate(current_node_name = current_node_name.x
+         ,total_premium    = coalesce(as.numeric(total_premium.x) ,total_premium.y)) %>%
+  select(submission_id ,ordinal_number ,current_node_name ,status ,submit_date ,sent_date ,total_premium) %>%
+  arrange(submission_id)
+
+AllProposalsSentWithMissing <- ProposalsExcludingOverrides %>%
+  bind_rows(MissingProposalOverrides) %>%
+  bind_rows(OverlapProposalOverrides) %>%
+  arrange(submission_id ,ordinal_number)
+
+BoundProposals <- AllProposalsSentWithMissing %>%
+  filter(current_node_name %in% c("bound" ,"begin binding" ,"binding requested"))
+
+DuplicateBoundProposals <- BoundProposals %>%
+  group_by(submission_id) %>%
+  summarise(Count = n()) %>%
+  filter(Count > 1)
+
+BoundDuplicatesRemoved <- BoundProposals %>%
+  inner_join(DuplicateBoundProposals ,by = "submission_id") %>%
+  filter(current_node_name == "bound") %>%
+  select(-Count)
+
+BoundProposalsWithoutDuplicates <- anti_join(BoundProposals ,BoundDuplicatesRemoved ,by = "submission_id") %>%
+  bind_rows(BoundDuplicatesRemoved) %>%
+  rename(bound_premium = total_premium)
+
+ProposalsExcludingBinds <- anti_join(AllProposalsSentWithMissing ,BoundProposalsWithoutDuplicates ,by = "submission_id")
+
+SentProposals <- ProposalsExcludingBinds %>% 
+  filter(current_node_name %in% c("sent" ,"sent again")) %>%
+  group_by(submission_id) %>%
+  summarise(max_ordinal_number = max(ordinal_number))
+ProposalsNotSent <- ProposalsExcludingBinds %>% 
+  filter(!(current_node_name %in% c("sent" ,"sent again"))) %>%
+  group_by(submission_id) %>%
+  summarise(max_ordinal_number = max(ordinal_number))
+
+ProposalsNotSentWithoutDuplicates <- anti_join(ProposalsNotSent ,SentProposals ,by = "submission_id")
+
+LatestProposalsWithoutDuplicates <- bind_rows(SentProposals ,ProposalsNotSentWithoutDuplicates)
+
+LatestProposalsExcludingBinds <- ProposalsExcludingBinds %>%
+  inner_join(LatestProposalsWithoutDuplicates ,by = c("submission_id" ,"ordinal_number" = "max_ordinal_number")) %>%
+  rename(quoted_premium = total_premium) %>%
+  select(-status)
+
+FinalProposalsExcludingLost <- bind_rows(BoundProposalsWithoutDuplicates ,LatestProposalsExcludingBinds)
+
+#####################################################################################
+## SNAP Input --Lost submissions
+#####################################################################################
+
+myconn <- odbcConnect("BI_SNAP_WC_Daily")
+
+RawSnapData <- sqlQuery(myconn ,"
+Select 
+ T02.id, 
+ T02.submission_number                As Quote_ID, 
+ TA.name                              As Name_Insured, 
+ P.first_name                         As UWName_First, 
+ P.last_name                          As UWName_Last, 
+ P2.first_name + ' ' + P2.last_name   As Producer, 
+ T02.carrier_profit_center, 
+ T02.agent_quote_status, 
+ DateAdd(day, 1, T02.effective_date)  As DateEffective, 
+ DateAdd(day, 1, T02.expiration_date) As DateExpiration, 
+ s.name                               As submissionstatus, 
+ T02.status_reason, 
+ Case When s.name In ('bind confirmed', 'bind requested', 'cancelled', 'expired', 'issued', 'lost', 'non-renewed', 'pending issuance', 'quoted', 'renewed') Then 1 Else 0 End As QuoteCount, 
+ Case When s.name In ('bind confirmed', 'cancelled', 'expired', 'issued', 'non-renewed', 'renewed', 'bind requested', 'pending issuance') Then 1 Else 0 End As BoundCount,
+ A.agency_number As BrokerNumber, 
+ Case When T02.transaction_type = '1' Then 'Renewal' Else 'New' End As 'Renewal Flag', 
+ T02.policy_number,
+ left(coalesce(T04d.value,T04w.value),2) as 'GoverningState',
+ substring(coalesce(T04d.value,T04w.value),4,7) as 'GoverningClass',
+ case when DSC.DstateCount = 0 then WSC.WstateCount else DSC.DstateCount end as 'StateCount'
+From SNAP_WC_Daily.dbo.submission                 T02 
+   Left Join SNAP_WC_Daily.dbo.person               P On T02.responsible_underwriter_id = P.id 
+   Left Join SNAP_WC_Daily.dbo.person              P2 On T02.agent_id = P2.id 
+   Left Join SNAP_WC_Daily.dbo.agency               A On A.id = T02.agency_id 
+   Left Join SNAP_WC_Daily.dbo.account             TA On T02.account_id = TA.id 
+   Left Join SNAP_WC_Daily.dbo.submission_status    s On s.id = T02.status 
+   Left Join SNAP_WC_daily.dbo.form              T03d On T02.form_set_id = T03d.owner_id and T03d.name = 'WC:Application:Locations - Class Codes'
+   Left Join SNAP_WC_daily.dbo.form_field        T04d On T03d.id = T04d.form_id and T04d.name = 'governingClassCode'
+   Left Join 
+          (
+           SELECT 
+            T02.id 
+            ,count(distinct T04d.value) as 'WstateCount'
+           FROM SNAP_WC.dbo.submission          T02
+              Left Join SNAP_WC.dbo.form       T03d on T02.form_set_id = T03d.owner_id and T03d.name = 'WC:Application:Locations - Class Codes'
+              Left Join SNAP_WC.dbo.form_field T04d on T03d.id = T04d.form_id and T04d.name like 'State%'
+           Where T02.submission_number Is Not Null 
+             And T02.effective_date >= Concat(Year(GetDate()) - 7, '-12-31')  
+           Group by   T02.id 
+          )                                       WSC on WSC.id = T02.id
+   Left Join SNAP_WC.dbo.form                    T03w On T02.form_set_id = T03w.owner_id and T03w.name = 'WC:Application:Locations - Class Codes'
+   Left Join SNAP_WC.dbo.form_field              T04w On T03w.id = T04w.form_id and T04w.name = 'governingClassCode'
+Left Join 
+       (
+        SELECT 
+         T02.id
+         ,count(distinct T04d.value) as 'DstateCount'
+        FROM SNAP_WC_daily.dbo.submission T02
+           Left Join SNAP_WC_daily.dbo.form T03d on T02.form_set_id = T03d.owner_id and T03d.name = 'WC:Application:Locations - Class Codes'
+           Left Join SNAP_WC_daily.dbo.form_field T04d on T03d.id = T04d.form_id and T04d.name like 'State%'
+        Where T02.submission_number Is Not Null 
+          And T02.effective_date >= Concat(Year(GetDate()) - 7, '-12-31')  
+        Group by   T02.id     
+       )                                          DSC on DSC.id = T02.id
+Where T02.submission_number Is Not Null 
+  And T02.effective_date >= Concat(Year(GetDate()) - 7, '-12-31') 
+Order By DateAdd(day, 1, T02.effective_date) Desc
+" ,na.strings = "RRR")
+
+RawSentQuotes <- sqlQuery(myconn ,"
+Select Distinct 
+ SNAP_WC_Daily.dbo.quote.submission_id, 
+ Max(SNAP_WC_Daily.dbo.quote.sent_date) As sent_date 
+From SNAP_WC_Daily.dbo.quote 
+Group By SNAP_WC_Daily.dbo.quote.submission_id                         
+")
+
+close(myconn)
+
+RawSnapData <- RawSnapData %>%
+  as_tibble() %>%
+  mutate_if(is.factor ,as.character)
+RawSentQuotes <- as_tibble(RawSentQuotes)
+
+LostSubmissions <- RawSnapData %>%
+  filter(submissionstatus == "lost")
+SubmissionsNotLost <- RawSnapData %>%
+  filter(!(submissionstatus == "lost"))
+
+LostSubmissionsWithSentDate <- LostSubmissions %>%
+  left_join(RawSentQuotes ,by = c("id" = "submission_id")) %>%
+  mutate(QuoteCount = ifelse(is.na(sent_date) ,0 ,QuoteCount))
+
+SubmissionsIncludingLost <- bind_rows(SubmissionsNotLost ,LostSubmissionsWithSentDate)
+
+SubmissionsLostAndFinal <- SubmissionsIncludingLost %>%
+  inner_join(FinalProposalsExcludingLost ,by = c("id" = "submission_id")) %>%
+  mutate(bound_premium   = coalesce(bound_premium ,0)
+         ,quoted_premium = coalesce(quoted_premium ,0)
+         ,quoted_premium = ifelse(submissionstatus == "quoted" ,quoted_premium ,0)) %>%
+  rename(sent_date        = sent_date.x
+         ,proposal_number = ordinal_number) %>%
+  select(-c(current_node_name ,submit_date ,sent_date.y ,status)) %>%
+  arrange(desc(DateEffective))
+
+SubmissionsExcludingFinalProposals <- anti_join(SubmissionsIncludingLost ,FinalProposalsExcludingLost ,by = c("id" = "submission_id"))
+
+#####################################################################################
+## SNAP Input --Instant Quote Field
+#####################################################################################
+
+myconn <- odbcConnect("BI_SNAP_WC_Daily")
+
+InstantQuoteInformation <- sqlQuery(myconn ,"
+Select 
+ S.submission_number, 
+ S.effective_date, 
+ S.underwriting_automation_status, 
+ S.agent_quote_status, 
+ Case When S.agent_quote_status in(0 ,11) Then 'Non-IQ' Else 'IQ' End As 'IQ Flag' 
+From SNAP_WC_Daily.dbo.submission S
+Where S.submission_number Is Not Null 
+  And S.effective_date >= Concat(Year(GetDate()) - 7, '-12-31') 
+Order By S.effective_date Desc
+")
+
+close(myconn)
+
+InstantQuoteInformation <- as_tibble(InstantQuoteInformation)
+
+InstantQuoteInformation <- InstantQuoteInformation %>%
+  select(submission_number ,`IQ Flag`) %>%
+  rename(IQ_Type = `IQ Flag`)
+
+SubmissionsExcludingFinalProposalsWithIq <- inner_join(SubmissionsExcludingFinalProposals ,InstantQuoteInformation ,by = c("Quote_ID" = "submission_number")) %>%
+  select(-sent_date)
+
+#####################################################################################
+## SNAP Input --OI Values / Overrides
+#####################################################################################
+
+myconn <- odbcConnect("BI_SNAP_WC_Daily")
+
+OperatingIncome <- sqlQuery(myconn ,"
+Select 
+ DateAdd(day, 1, T02.effective_date)   As EffectiveDate, 
+ T02.submission_number                 As SubmissionNumber, 
+ T06.agency_number, T01.ordinal_number As ProposalNumber, 
+ T01.current_node_name                 As Status, 
+ T01.total_premium                     As QuotedPremium, 
+ O.name                                As BranchName, 
+ P.first_name + ' ' + P.last_name      As ResponsibleUW, 
+ coalesce(T04d.name,T04w.name)         as FormFieldName,
+ coalesce(T04d.value,T04w.value)       As FormFieldValue 
+From SNAP_WC_Daily.dbo.quote T01 
+inner Join SNAP_WC_Daily.dbo.submission T02 
+On T01.submission_id = T02.id 
+inner Join SNAP_WC_Daily.dbo.person P 
+On T02.responsible_underwriter_id = P.id 
+inner Join SNAP_WC_Daily.dbo.organization O 
+On T02.carrier_branch_id = O.id 
+inner Join SNAP_WC_Daily.dbo.agency T06 
+On T06.id = T02.agency_id 
+
+left Join SNAP_WC.dbo.form T03w 
+On T01.form_set_id = T03w.owner_id 
+and T03w.name = 'WC:Rating:Output'
+Left Join SNAP_WC.dbo.form_field T04w 
+On T03w.id = T04w.form_id 
+and T04w.name = 'operatingIncome'
+and T04w.value != ''
+
+Left Join SNAP_WC_Daily.dbo.form T03d 
+On T01.form_set_id = T03d.owner_id 
+and T03d.name = 'WC:Rating:Output'
+Left Join SNAP_WC_Daily.dbo.form_field T04d 
+On T03d.id = T04d.form_id 
+and T04d.name = 'operatingIncome'
+and T04d.value != ''
+         
+Where  DateAdd(day, 1, T02.effective_date) >=  Concat(Year(GetDate()) - 6, '-01-01')  
+and coalesce(T04d.name,T04w.name) = 'OperatingIncome'
+
+order by T02.effective_date, submissionnumber, proposalNumber        
+")
+
+OperatingIncomeOverrides <- sqlQuery(myconn ,"
+Select 
+DateAdd(day, 1, T02.effective_date) As EffectiveDate, 
+T02.submission_number As SubmissionNumber, 
+T06.agency_number, 
+T01.ordinal_number As ProposalNumber, 
+T01.current_node_name As Status, 
+T01.total_premium As QuotedPremium, 
+O.name As BranchName, 
+P.first_name + ' ' + P.last_name As ResponsibleUW, 
+coalesce(T04d.name,T04w.name) As FormFieldName, 
+coalesce(T04d.value,T04w.value) As FormFieldValue 
+
+
+From SNAP_WC_Daily.dbo.quote T01 
+Left Join SNAP_WC_Daily.dbo.submission T02 
+On T01.submission_id = T02.id 
+Left Join SNAP_WC_Daily.dbo.person P 
+On T02.responsible_underwriter_id = P.id 
+Left Join SNAP_WC_Daily.dbo.organization O 
+On T02.carrier_branch_id = O.id 
+Left Join SNAP_WC_Daily.dbo.agency T06 
+On T06.id = T02.agency_id
+
+Left Join SNAP_WC_Daily.dbo.form T03d
+On T01.form_set_id = T03d.owner_id 
+and T03d.name = 'WC:Rating:Output'
+Left Join SNAP_WC_Daily.dbo.form_field T04d 
+On T03d.id = T04d.form_id 
+and T04d.name = 'approvedOperatingIncomeOverride' 
+and T04d.name != ''
+
+Left Join SNAP_WC.dbo.form T03w 
+On T01.form_set_id = T03w.owner_id 
+and T03w.name = 'WC:Rating:Output'
+Left Join SNAP_WC.dbo.form_field T04w 
+On T03w.id = T04w.form_id 
+and T04w.name = 'approvedOperatingIncomeOverride' 
+and T04w.name != ''
+                                     
+Where DateAdd(day, 1, T02.effective_date) >= Concat(Year(GetDate()) - 6, '-01-01')  
+And coalesce(T04d.name,T04w.name) = 'approvedOperatingIncomeOverride' 
+                                     
+Order By T02.effective_date, SubmissionNumber, ProposalNumber                                  
+")
+
+close(myconn)
+
+OperatingIncome <- as_tibble(OperatingIncome) %>%
+  mutate_if(is.factor ,as.character) %>%
+  mutate(agency_number = str_pad(agency_number ,width = 7 ,side = "left" ,pad = "0"))
+OperatingIncomeOverrides <- as_tibble(OperatingIncomeOverrides) %>%
+  mutate_if(is.factor ,as.character) %>%
+  mutate(agency_number = str_pad(agency_number ,width = 7 ,side = "left" ,pad = "0"))
+
+OverrideLeftOnly <- anti_join(OperatingIncome ,OperatingIncomeOverrides ,by = c("SubmissionNumber" ,"ProposalNumber"))
+OverrideBoth <- inner_join(OperatingIncome ,OperatingIncomeOverrides ,by = c("SubmissionNumber" ,"ProposalNumber")) 
+OverrideRightOnly <- anti_join(OperatingIncomeOverrides ,OperatingIncome ,by = c("SubmissionNumber" ,"ProposalNumber"))
+
+OverrideBoth <- OverrideBoth %>%
+  mutate(EffectiveDate           = EffectiveDate.x
+         ,agency_number          = agency_number.x
+         ,Status                 = Status.x
+         ,QuotedPremium          = QuotedPremium.x
+         ,BranchName             = BranchName.x
+         ,ResponsibleUW          = ResponsibleUW.x
+         ,FormFieldName          = FormFieldName.x
+         ,FormFieldValue         = FormFieldValue.x
+         ,Override               = FormFieldName.y
+         ,Override_Value         = FormFieldValue.y
+  ) %>%
+  select(-contains(".x") ,-contains(".y"))
+
+OverrideRightOnly <- OverrideRightOnly %>%
+  rename(Override        = FormFieldName
+         ,Override_Value = FormFieldValue)
+
+OperatingIncomeWithOverrides <- bind_rows(OverrideBoth ,OverrideLeftOnly ,OverrideRightOnly)
+
+SubmissionsWithoutOperatingIncome <- anti_join(SubmissionsLostAndFinal ,OperatingIncomeWithOverrides ,by = c("Quote_ID" = "SubmissionNumber" ,"proposal_number" = "ProposalNumber"))
+SubmissionsWithOperatingIncome <- inner_join(SubmissionsLostAndFinal ,OperatingIncomeWithOverrides ,by = c("Quote_ID" = "SubmissionNumber" ,"proposal_number" = "ProposalNumber")) %>%
+  select(-c(EffectiveDate ,agency_number ,Status ,QuotedPremium ,BranchName ,ResponsibleUW ,Override))
+
+SubmissionsWithoutOperatingIncome <- SubmissionsWithoutOperatingIncome %>%
+  mutate(FormFieldValue = ifelse(bound_premium > 0 ,99999999 ,0)
+         ,Quoted_OI     = ifelse(quoted_premium > 0 ,99999999 ,0)
+         ,IQ_Type       = "IQ")
+
+SubmissionsWithOperatingIncome <- SubmissionsWithOperatingIncome %>%
+  mutate(Quoted_OI           = ifelse(quoted_premium > 0 ,as.numeric(FormFieldValue) ,0)
+         ,Quoted_OI_Override = ifelse(quoted_premium > 0 ,as.numeric(Override_Value) ,0)
+         ,FormFieldValue     = ifelse(BoundCount > 0 ,as.numeric(FormFieldValue) ,0)
+         ,Override_Value     = ifelse(is.na(Override_Value) ,as.numeric(Override_Value) ,ifelse(BoundCount > 0 ,as.numeric(Override_Value) ,0))
+         ,FormFieldValue     = coalesce(Override_Value ,FormFieldValue) %>% as.numeric()
+         ,Quoted_OI          = ifelse(coalesce(Quoted_OI_Override ,0) > 0 ,Quoted_OI_Override ,Quoted_OI)
+         ,IQ_Type            = "Non-IQ"
+         ,SNAP_IQ_Status     = ifelse(agent_quote_status == 0 ,"Not Eligible" ,ifelse(agent_quote_status == 1 ,"Eligible" ,"Not Eligible by UW"))
+  ) %>%
+  select(-c(FormFieldName ,Override_Value ,Quoted_OI_Override))
+
+GaSubmissions <- SubmissionsWithOperatingIncome %>%
+  filter(carrier_profit_center == 53)
+
+NonGaSubmissions <- SubmissionsWithOperatingIncome %>%
+  filter(carrier_profit_center != 53 | is.na(carrier_profit_center))
+
+#####################################################################################
+## SNAP Input --GA Workaround
+#####################################################################################
+
+myconn <- odbcConnect("BI_SNAP_WC_Daily")
+
+StpFlag <- sqlQuery(myconn ,"
+Select 
+T01.submission_number As SubmissionNumber, 
+T03.name As SnapSheetName, 
+T04.name, 
+T04.value 
+From SNAP_WC_Daily.dbo.submission T01 
+Left Join SNAP_WC_Daily.dbo.form T03 
+On T01.form_set_id = T03.owner_id 
+Left Join SNAP_WC_Daily.dbo.form_field T04 
+On T03.id = T04.form_id 
+Where T01.submission_number Is Not Null 
+And T04.name Like 'stp' 
+And Year(T01.effective_date) >= Year(GetDate()) - 7 
+And T01.carrier_profit_center = '53' and T04.value = 'true'                    
+")
+
+close(myconn)
+
+StpFlag <- as_tibble(StpFlag)
+
+GaSubmissionsInStp <- inner_join(StpFlag ,GaSubmissions ,by = c("SubmissionNumber" = "Quote_ID"))
+GaSubmissionsNotStp <- anti_join(GaSubmissions ,StpFlag ,by = c("Quote_ID" = "SubmissionNumber"))
+
+GaSubmissionsInStpAndAgent <- GaSubmissionsInStp %>%
+  mutate(Quote_ID = SubmissionNumber) %>%
+  filter(agent_quote_status %in% c(1 ,11))
+GaSubmissionsInStpAndNotAgent <- GaSubmissionsInStp %>%
+  mutate(Quote_ID = SubmissionNumber) %>%
+  filter(!(agent_quote_status %in% c(1 ,11))) %>%
+  select(-c(SubmissionNumber ,SnapSheetName ,name ,value))
+
+myconn <- odbcConnect("BI_SNAP_WC_Daily")
+
+PreviousGaIqQuotes <- sqlQuery(myconn ,"
+Select Distinct 
+DateAdd(day, 1, T02.effective_date) As EffectiveDate, 
+T02.submission_number As SubmissionNumber, 
+T06.agency_number, 
+O.name As BranchName, 
+P.first_name + ' ' + P.last_name As ResponsibleUW, 
+T03.name As FormSectionName 
+From SNAP_WC_Daily.dbo.quote T01 
+Left Join SNAP_WC_Daily.dbo.submission T02 
+On T01.submission_id = T02.id 
+Left Join SNAP_WC_Daily.dbo.person P 
+On T02.responsible_underwriter_id = P.id 
+Left Join SNAP_WC_Daily.dbo.organization O 
+On T02.carrier_branch_id = O.id 
+Left Join SNAP_WC_Daily.dbo.form T03 
+On T01.form_set_id = T03.owner_id 
+Left Join SNAP_WC_Daily.dbo.form_field T04 
+On T03.id = T04.form_id 
+Left Join SNAP_WC_Daily.dbo.uiform_field T05 
+On T04.field_template_id = T05.field_template_id 
+Left Join SNAP_WC_Daily.dbo.agency T06 
+On T06.id = T02.agency_id 
+Where T03.name Like '%Instant Quote%' 
+And T02.carrier_profit_center = '53' 
+And T02.effective_date >= Concat(Year(GetDate()) - 7, '-12-31') 
+Order By EffectiveDate
+")
+
+close(myconn)
+
+PreviousGaIqQuotes <- as_tibble(PreviousGaIqQuotes)
+
+GaSubmissionsInStpAgentAndPrevious <- inner_join(PreviousGaIqQuotes ,GaSubmissionsInStpAndAgent ,by = c("SubmissionNumber")) %>%
+  select(-c(EffectiveDate ,agency_number ,BranchName ,ResponsibleUW)) %>%
+  mutate(IQ_Type         = "IQ"
+         ,FormFieldValue = ifelse(FormFieldValue > 0 ,99999999 ,0)
+         ,Quoted_OI      = ifelse(Quoted_OI > 0 ,99999999 ,0)
+  ) %>%
+  select(-c(FormSectionName ,SubmissionNumber ,SnapSheetName ,name ,value))
+GaSubmissionsInStpAgentAndNotPrevious <- anti_join(GaSubmissionsInStpAndAgent ,PreviousGaIqQuotes ,by = c("SubmissionNumber")) %>%
+  select(-c(SubmissionNumber ,SnapSheetName ,name ,value))
+
+SubmissionsWithGaCorrected <- bind_rows(GaSubmissionsInStpAgentAndNotPrevious ,GaSubmissionsInStpAgentAndPrevious ,GaSubmissionsInStpAndNotAgent ,GaSubmissionsNotStp ,NonGaSubmissions) %>%
+  select(-c(SNAP_IQ_Status))
+
+FinalSubmissions <- bind_rows(SubmissionsWithGaCorrected ,SubmissionsWithoutOperatingIncome ,SubmissionsExcludingFinalProposalsWithIq)
+
+FinalSubmissions <- FinalSubmissions %>%
+  select(-c(carrier_profit_center ,agent_quote_status)) %>%
+  rename(BoundPremium   = bound_premium
+         ,QuotedPremium = quoted_premium) %>%
+  mutate(Name_Insured     = str_replace_all(str_trim(Name_Insured ,side = "both") ,pattern = "/n|/r" ,replacement = " ")
+         ,Producer        = str_trim(Producer ,side = "both")
+         ,status_reason   = str_trim(status_reason ,side = "both")
+         ,proposal_number = coalesce(proposal_number ,0)
+         ,BoundPremium    = coalesce(BoundPremium ,0)
+         ,QuotedPremium   = coalesce(QuotedPremium ,0)
+         ,FormFieldValue  = coalesce(FormFieldValue ,0)
+         ,Quoted_OI       = coalesce(Quoted_OI ,0)
+  )
+
+#####################################################################################
+## Profit --New Section
+#####################################################################################
+
+myconn <- odbcConnect("BI_SNAP_WC")
+
+RawProfit <- sqlQuery(myconn ,"
+Select 
+DateAdd(day, 1, T02.effective_date) As EffectiveDate, 
+T02.submission_number As SubmissionNumber, 
+T06.agency_number, 
+T01.ordinal_number As ProposalNumber, 
+T01.current_node_name As Status, 
+T01.total_premium As QuotedPremium, 
+O.name As BranchName, 
+P.first_name + ' ' + P.last_name As ResponsibleUW, 
+T03.name As FormSectionName, 
+T04.name As FormFieldName, 
+T04.value As FormFieldValue 
+From SNAP_WC.dbo.quote T01 
+Left Join SNAP_WC.dbo.submission T02 
+On T01.submission_id = T02.id 
+Left Join SNAP_WC.dbo.person P 
+On T02.responsible_underwriter_id = P.id 
+Left Join SNAP_WC.dbo.organization O 
+On T02.carrier_branch_id = O.id 
+Left Join SNAP_WC.dbo.form T03 
+On T01.form_set_id = T03.owner_id 
+Left Join SNAP_WC.dbo.form_field T04 
+On T03.id = T04.form_id 
+Left Join SNAP_WC.dbo.uiform_field T05 
+On T04.field_template_id = T05.field_template_id 
+Left Join SNAP_WC.dbo.agency T06 
+On T06.id = T02.agency_id 
+Where DateAdd(day, 1, T02.effective_date) >= concat(year(getdate())-7,'-12-31')
+And T04.name Like '%profitDollars%' 
+And T01.status != '24' 
+and T01.sent_date Is Not Null
+Order By T02.effective_date, SubmissionNumber, ProposalNumber
+")
+
+close(myconn)
+
+myconn <- odbcConnect("BI_SNAP_WC_Daily")
+
+RawProfitDaily <- sqlQuery(myconn ,"
+Select 
+DateAdd(day, 1, T02.effective_date) As EffectiveDate, 
+T02.submission_number As SubmissionNumber, 
+T06.agency_number, 
+T01.ordinal_number As ProposalNumber, 
+T01.current_node_name As Status, 
+T01.total_premium As QuotedPremium, 
+O.name As BranchName, 
+P.first_name + ' ' + P.last_name As ResponsibleUW, 
+T03.name As FormSectionName, 
+T04.name As FormFieldName, 
+T04.value As FormFieldValue 
+From SNAP_WC_daily.dbo.quote T01 
+Left Join SNAP_WC_daily.dbo.submission T02 
+On T01.submission_id = T02.id 
+Left Join SNAP_WC_daily.dbo.person P 
+On T02.responsible_underwriter_id = P.id 
+Left Join SNAP_WC_daily.dbo.organization O 
+On T02.carrier_branch_id = O.id 
+Left Join SNAP_WC_daily.dbo.form T03 
+On T01.form_set_id = T03.owner_id 
+Left Join SNAP_WC_daily.dbo.form_field T04 
+On T03.id = T04.form_id 
+Left Join SNAP_WC_daily.dbo.uiform_field T05 
+On T04.field_template_id = T05.field_template_id 
+Left Join SNAP_WC_daily.dbo.agency T06 
+On T06.id = T02.agency_id 
+Where DateAdd(day, 1, T02.effective_date) >= concat(year(getdate())-7,'-12-31')
+And T04.name Like '%profitDollars%' 
+And T01.status != '24' 
+and T01.sent_date Is Not Null
+Order By T02.effective_date, SubmissionNumber, ProposalNumber
+")
+
+close(myconn)
+
+RawProfit <- as_tibble(RawProfit) %>%
+  mutate_if(is.factor ,as.character) %>%
+  mutate(agency_number = str_pad(agency_number ,width = 7 ,side = "left" ,pad = "0"))
+RawProfitDaily <- as_tibble(RawProfitDaily) %>%
+  mutate_if(is.factor ,as.character) %>%
+  mutate(agency_number = str_pad(agency_number ,width = 7 ,side = "left" ,pad = "0"))
+
+ProfitCombined <- full_join(RawProfit ,RawProfitDaily ,by = c("SubmissionNumber" ,"ProposalNumber"))
+
+ProfitCombined <- ProfitCombined %>%
+  mutate(EffectiveDate    = coalesce(EffectiveDate.y ,EffectiveDate.x)
+         ,agency_number   = coalesce(agency_number.y ,agency_number.x)
+         ,Status          = coalesce(Status.y ,Status.x)
+         ,QuotedPremium   = coalesce(QuotedPremium.y ,QuotedPremium.x)
+         ,BranchName      = coalesce(BranchName.y ,BranchName.x)
+         ,ResponsibleUW   = coalesce(ResponsibleUW.y ,ResponsibleUW.x)
+         ,FormSectionName = coalesce(FormSectionName.y ,FormSectionName.x)
+         ,FormFieldName   = coalesce(FormFieldName.y ,FormFieldName.x)
+         ,FormFieldValue  = coalesce(FormFieldValue.y ,FormFieldValue.x)
+  ) %>%
+  select(-contains(".x") ,-contains(".y"))
+
+OverrideAccounts <- RawProposalOverrides %>%
+  rename(SubmissionNumber = Submission_Number
+         ,ProposalNumber  = `Proposal Number`
+         ,Status          = `New Status`) %>%
+  mutate(Status = tolower(Status)) %>%
+  select(SubmissionNumber ,ProposalNumber ,Status)
+
+ProfitWithOverrides <- left_join(ProfitCombined ,OverrideAccounts ,by = c("SubmissionNumber" ,"ProposalNumber") ,suffix = c("_left" ,"_right")) %>%
+  mutate(Status = coalesce(as.character(Status_right) ,as.character(Status_left))) %>%
+  select(-contains("Status_"))
+
+BoundAccountsWithProfit <- ProfitWithOverrides %>%
+  filter(Status %in% c("bound" ,"binding requested"))
+
+BoundAccountWithProfitDuplicates <- BoundAccountsWithProfit %>%
+  group_by(SubmissionNumber) %>%
+  mutate(Count = n()) %>%
+  ungroup() %>%
+  filter(Count > 1) %>%
+  select(-Count)
+
+BoundAccountsWithProfitNotDuplicated <- anti_join(BoundAccountsWithProfit ,BoundAccountWithProfitDuplicates ,by = c("SubmissionNumber"))
+
+BoundAccountsWithProfitNoLongerDuplicated <- BoundAccountWithProfitDuplicates %>%
+  filter(Status == "bound")
+
+LatestProposalNumberForProfitNoLongerDuplicated <- BoundAccountsWithProfitNoLongerDuplicated %>%
+  group_by(SubmissionNumber) %>%
+  summarise(Max_ProposalNumber = max(ProposalNumber))
+
+BoundAccountsWithProfitAndLatestProposal <- inner_join(BoundAccountsWithProfitNoLongerDuplicated ,LatestProposalNumberForProfitNoLongerDuplicated ,by = c("SubmissionNumber" ,"ProposalNumber" = "Max_ProposalNumber"))
+
+FinalBoundWithProfitInfo <- bind_rows(BoundAccountsWithProfitNotDuplicated ,BoundAccountsWithProfitAndLatestProposal)
+
+FinalBoundWithProfitInfoNamed <- FinalBoundWithProfitInfo %>%
+  rename(bound_profit = FormFieldValue) %>%
+  select(SubmissionNumber ,bound_profit)
+
+NotBoundWithProfit <- anti_join(ProfitWithOverrides ,FinalBoundWithProfitInfoNamed ,by = "SubmissionNumber")
+
+SentNotBoundWithProfit <- NotBoundWithProfit %>%
+  filter(Status %in% c("sent" ,"sent again") | is.na(Status)) 
+
+NotSentNotBoundWithProfit <- NotBoundWithProfit %>%
+  filter(!(Status %in% c("sent" ,"sent again") | is.na(Status)))
+
+SentNotBoundWithProfitMaxProposal <- SentNotBoundWithProfit %>%
+  group_by(SubmissionNumber) %>%
+  summarise(Max_ProposalNumber = max(ProposalNumber))
+
+NotSentNotBoundWithProfitMaxProposal <- NotSentNotBoundWithProfit %>%
+  group_by(SubmissionNumber) %>%
+  summarise(Max_ProposalNumber = max(ProposalNumber)) 
+
+UniqueSubmissionsNotSentNotBoundWithProfitMaxProposal <- anti_join(NotSentNotBoundWithProfitMaxProposal ,SentNotBoundWithProfitMaxProposal ,by = "SubmissionNumber")
+
+SentWithProfitMaxProposal <- bind_rows(SentNotBoundWithProfitMaxProposal ,UniqueSubmissionsNotSentNotBoundWithProfitMaxProposal)
+
+FinalNotBoundWithProfit <- inner_join(NotBoundWithProfit ,SentWithProfitMaxProposal ,by = c("SubmissionNumber" ,"ProposalNumber" = "Max_ProposalNumber")) %>%
+  select(SubmissionNumber ,quoted_profit = FormFieldValue) 
+
+FinalProfitInformation <- bind_rows(FinalBoundWithProfitInfoNamed ,FinalNotBoundWithProfit) %>%
+  unique()
+
+#####################################################################################
+## Overrides --New Section
+#####################################################################################
+
+FinalSubmissionsWithProfitInformation <- FinalSubmissions %>%
+  inner_join(FinalProfitInformation ,by = c("Quote_ID" = "SubmissionNumber")) %>%
+  mutate(quoted_profit = ifelse((is.na(QuotedPremium) | QuotedPremium == 0) ,0 ,quoted_profit)
+         ,BrokerNumber  = str_pad(BrokerNumber ,width = 7 ,side = "left" ,pad = "0"))
+
+FinalSubmissionsWithoutProfitInformation <- FinalSubmissions %>%
+  anti_join(FinalProfitInformation ,by = c("Quote_ID" = "SubmissionNumber")) %>%
+  mutate(bound_profit   = ifelse(BoundCount == 1 ,99999999 ,0)
+         ,quoted_profit = ifelse((BoundPremium == 0 & QuotedPremium > 0) ,99999999 ,0)
+         ,BrokerNumber  = str_pad(BrokerNumber ,width = 7 ,side = "left" ,pad = "0"))
+
+FinalSubmissionsWithProfit <- bind_rows(FinalSubmissionsWithProfitInformation ,FinalSubmissionsWithoutProfitInformation)
+
+AgencyCodeOverrides <- read_xlsx("//DC1CFS01/Company/Ent Strategy and Analytics/PFP/Reports/Dashboard/PFP Overrides.xlsx")
+
+colnames(AgencyCodeOverrides) <- str_remove_all(colnames(AgencyCodeOverrides) ,pattern = " ")
+
+AgencyCodeOverrides <- AgencyCodeOverrides
+
+FinalSubmissionsWithProfitAndAgencyOverride <- FinalSubmissionsWithProfit %>%
+  left_join(AgencyCodeOverrides ,by = c("Quote_ID" = "Submission_ID" ,"BrokerNumber" = "OriginalAgencyCode")) %>%
+  select(-c(Reason)) %>%
+  mutate(BrokerNumber = coalesce(NewAgencyCode ,BrokerNumber)
+         ,DateEffective = floor_date(DateEffective ,unit = "day")) %>%
+  select(-c(NewAgencyCode ,id)) %>%
+  arrange(Quote_ID)
+
+#####################################################################################
+## Agency Assignments to Submissions --New Section
+#####################################################################################
+
+myconn <- odbcConnect("BI_PFP")
+
+RawAgentUnderwriterAssignment <- sqlQuery(myconn ,"
+select * from dbo.Agent_Employee_Assign                                          
+")
+
+RawAgencyReassignments <- sqlQuery(myconn ,"
+select * from dbo.Agency_Reassign                                   
+")
+
+close(myconn)
+
+RawAgentUnderwriterAssignment <- as_tibble(RawAgentUnderwriterAssignment) 
+RawAgencyReassignments <- as_tibble(RawAgencyReassignments) %>%
+  mutate(Agency_To              = str_pad(Agency_To ,width = 7 ,side = "left" ,pad = "0")
+         ,Agency_From           = str_pad(Agency_From ,width = 7 ,side = "left" ,pad = "0")
+         ,Agency_Reassign_Final = str_pad(Agency_Reassign_Final ,width = 7 ,side = "left" ,pad = "0"))
+
+AgentUwAssignment <- RawAgentUnderwriterAssignment %>%
+  mutate_at(vars(Effective_Start ,Effective_End) ,as.Date) %>%
+  mutate(Effective_End = coalesce(Effective_End ,ymd(20991231))
+         ,Agency_Code  = str_pad(Agency_Code ,width = 7 ,side = "left" ,pad = "0"))
+
+FinalSubmissionsWithProfitWithAssignmentsAndDuplicates <- FinalSubmissionsWithProfitAndAgencyOverride %>%
+  inner_join(AgentUwAssignment ,by = c("BrokerNumber" = "Agency_Code")) %>%
+  mutate_at(vars(DateEffective ,DateExpiration) ,floor_date ,unit = "day") %>%
+  select(-c(ID ,UT_ID ,Updated_By ,Updated_Date))
+
+FinalSubmissionsWithProfitFiltered <- FinalSubmissionsWithProfitWithAssignmentsAndDuplicates %>%
+  filter(Effective_Start <= DateEffective & DateEffective <= Effective_End)
+
+FinalSubmissionsWithProfitUnfiltered <- FinalSubmissionsWithProfitWithAssignmentsAndDuplicates %>%
+  filter(!(Effective_Start <= DateEffective & DateEffective <= Effective_End))
+
+FinalSubmissionsMissingAgency <- anti_join(FinalSubmissionsWithProfitAndAgencyOverride ,FinalSubmissionsWithProfitFiltered ,by = c("BrokerNumber" ,"Quote_ID" ,"DateEffective"))
+
+AgencyInformationForBadAgencyEffectiveDates <- FinalSubmissionsWithProfitUnfiltered %>%
+  group_by(BrokerNumber) %>%
+  summarise(Max_Effective_Start  = max(Effective_Start)
+            ,Max_Effective_End   = max(Effective_End)
+            ,start_of_agency     = min(Effective_Start)
+            ,end_start_of_agency = min(Effective_End))
+
+FinalSubmissionsAgencyReassignmentBase <- inner_join(AgencyInformationForBadAgencyEffectiveDates ,FinalSubmissionsMissingAgency ,by = c("BrokerNumber"))
+
+SubmissionsWithAgencyEffectiveBeforeAppointment <- FinalSubmissionsAgencyReassignmentBase %>%
+  filter(DateEffective > Max_Effective_Start)
+
+SubmissionsWithAgencyEffectiveAfterAppointment <- FinalSubmissionsAgencyReassignmentBase %>%
+  filter(!(DateEffective > Max_Effective_Start))
+
+SubmissionsWithAgencyEffectiveBeforeAppointmentNotReassigned <- anti_join(SubmissionsWithAgencyEffectiveBeforeAppointment ,RawAgencyReassignments ,by = c("BrokerNumber" = "Agency_From"))
+
+SubmissionsWithBrokerInformation <- bind_rows(SubmissionsWithAgencyEffectiveBeforeAppointmentNotReassigned ,SubmissionsWithAgencyEffectiveAfterAppointment)
+
+SubmissionsWithBrokerInformation <- SubmissionsWithBrokerInformation %>%
+  mutate(correct_effective_start = if_else(DateEffective > Max_Effective_End ,Max_Effective_Start ,start_of_agency)
+         ,correct_effective_end  = if_else(DateEffective < start_of_agency ,end_start_of_agency ,Max_Effective_End))
+
+SubmissionsWithCorrectedBrokerInformation <- inner_join(AgentUwAssignment ,SubmissionsWithBrokerInformation ,by = c("Agency_Code" = "BrokerNumber" ,"Effective_Start" = "correct_effective_start" ,"Effective_End" = "correct_effective_end")) %>%
+  rename(BrokerNumber = Agency_Code) %>%
+  select(-c(ID ,UT_ID ,Updated_By ,Updated_Date ,Max_Effective_Start ,Max_Effective_End ,start_of_agency ,end_start_of_agency))
+
+SubmissionsWithAgencyReassignment <- inner_join(SubmissionsWithAgencyEffectiveBeforeAppointment ,RawAgencyReassignments ,by = c("BrokerNumber" = "Agency_From"))
+
+SubmissionsWithAgencyReassignment2 <- SubmissionsWithAgencyReassignment %>%
+  select(-c(ID ,Last_Updated ,Effective_Start ,Effective_End))
+
+SubmissionsWithAgencyReassignmentInformation <- inner_join(AgentUwAssignment ,SubmissionsWithAgencyReassignment2 ,by = c("Agency_Code" = "Agency_To")) %>%
+  filter(Effective_Start <= DateEffective & DateEffective <= Effective_End)
+
+ReassignedAgencySubmissions <- anti_join(SubmissionsWithAgencyReassignment ,SubmissionsWithAgencyReassignmentInformation ,by = c("Quote_ID"))
+
+ReassignedAgencySubmissionsAfterAppointment <- inner_join(AgentUwAssignment ,ReassignedAgencySubmissions ,by = c("Agency_Code" = "Agency_Reassign_Final") ,suffix = c("" ,".y")) %>%
+  filter(Effective_Start <= DateEffective & DateEffective <= Effective_End) %>%
+  mutate(BrokerNumber = Agency_Code) %>%
+  select(-c(ID ,Agency_Code ,UT_ID ,Updated_By ,Updated_Date ,ID.y ,Agency_To ,Last_Updated ,Effective_Start.y ,Effective_End.y ,Max_Effective_Start ,Max_Effective_End ,start_of_agency ,end_start_of_agency))
+
+ReassignedAgencyAppointments <- SubmissionsWithAgencyReassignmentInformation %>%
+  mutate(BrokerNumber = Agency_Code) %>%
+  select(-c(ID ,Agency_Code ,UT_ID ,Updated_By.x ,Updated_Date.x ,Agency_Reassign_Final ,Max_Effective_Start ,Max_Effective_End ,start_of_agency ,end_start_of_agency))
+
+AllReassignedAgencies <- bind_rows(ReassignedAgencyAppointments ,ReassignedAgencySubmissionsAfterAppointment)
+
+SubmissionsWithProfitAndAgency <- bind_rows(FinalSubmissionsWithProfitFiltered ,SubmissionsWithCorrectedBrokerInformation ,AllReassignedAgencies)
+
+#####################################################################################
+## OI Override --New Section
+#####################################################################################
+
+myconn <- odbcConnect("BI_PFP")
+
+RawTargetOperatingIncome <- sqlQuery(myconn ,"
+Select case when p.Branch_ID = 36 then 62 else p.Branch_ID end as 'Branch_ID'
+, b.Branch_Desc
+, p.Business_Type
+, p.IQ_Type
+, p.EffectivePeriodStart
+, p.EffectivePeriodEnd
+, p.Combined_Ratio
+, p.Operating_Income_Ratio 
+From PFP.dbo.Branch_Proj p 
+Left Join PFP.dbo.Branch_Master b 
+On case when p.Branch_ID = 36 then 62 else p.Branch_ID end = b.Branch_ID 
+Where p.IQ_Type = 'Yes' 
+Order By b.Branch_Desc, p.EffectivePeriodStart        
+")
+
+close(myconn)
+
+RawTargetOperatingIncome <- as_tibble(RawTargetOperatingIncome)
+
+TargetOperatingIncome <- RawTargetOperatingIncome %>%
+  mutate(Business_Type         = str_to_title(Business_Type)
+         ,EffectivePeriodEnd   = coalesce(ymd(floor_date(EffectivePeriodEnd ,unit = "day")) ,ymd(20991231))
+         ,EffectivePeriodStart = if_else((Branch_ID == 40 & ymd(floor_date(EffectivePeriodStart ,unit = "day")) < ymd(20180302)) ,ymd(20180201) ,ymd(floor_date(EffectivePeriodStart ,unit = "day"))))
+
+SubmissionsWithProfitAndAgency <- SubmissionsWithProfitAndAgency %>%
+  mutate(Branch_ID = if_else(Branch_ID == 36 ,62L ,Branch_ID))
+
+SubmissionsWithProfitAgencyAndTargetOiUncorrected <- inner_join(TargetOperatingIncome ,SubmissionsWithProfitAndAgency ,by = c("Branch_ID" ,"Business_Type" = "Renewal Flag") ,suffix = c(".x" ,"")) %>%
+  mutate(renewal_flag = Business_Type) %>%
+  select(-c(Business_Type ,IQ_Type.x ,Effective_Start ,Effective_End))
+
+SubmissionsWithProfitAgencyAndTargetOi <- SubmissionsWithProfitAgencyAndTargetOiUncorrected %>%
+  filter(EffectivePeriodStart <= DateEffective & DateEffective <= EffectivePeriodEnd) %>%
+  rename(quoted_oi = Quoted_OI) %>%
+  mutate(oi             = if_else(BoundCount == 0 ,0 ,if_else(FormFieldValue == 99999999 ,Operating_Income_Ratio * BoundPremium ,FormFieldValue))
+         ,quoted_oi     = if_else(is.na(quoted_oi)  ,0 ,if_else(quoted_oi == 99999999 ,Operating_Income_Ratio * QuotedPremium ,quoted_oi))
+         ,bound_profit  = if_else(bound_profit == 99999999 ,BoundPremium * (Operating_Income_Ratio - .12) ,bound_profit)
+         ,quoted_profit = if_else(quoted_profit == 99999999 ,QuotedPremium * (Operating_Income_Ratio - .12) ,quoted_profit)
+  ) %>%
+  select(-c(EffectivePeriodStart ,EffectivePeriodEnd ,FormFieldValue))
+
+#####################################################################################
+## OI Override --Large Deductible Data
+#####################################################################################
+
+myconn <- odbcConnect("BI_SNAP_WC_Daily")
+
+RawOperatingInformation <- sqlQuery(myconn ,"
+Select 
+DateAdd(day, 1, T02.effective_date) As EffectiveDate,
+T02.submission_number As SubmissionNumber, 
+T06.agency_number, 
+T01.ordinal_number As ProposalNumber, 
+T01.current_node_name As Status, 
+T01.total_premium As QuotedPremium, 
+O.name As BranchName, 
+P.first_name + ' ' + P.last_name As ResponsibleUW, 
+T03.name As FormSectionName, 
+T04.name As FormFieldName, 
+T04.value As FormFieldValue 
+From SNAP_WC_Daily.dbo.quote T01 
+Left Join SNAP_WC_Daily.dbo.submission T02 
+On T01.submission_id = T02.id 
+Left Join SNAP_WC_Daily.dbo.person P 
+On T02.responsible_underwriter_id = P.id 
+Left Join SNAP_WC_Daily.dbo.organization O 
+On T02.carrier_branch_id = O.id 
+Left Join SNAP_WC_Daily.dbo.form T03 
+On T01.form_set_id = T03.owner_id 
+Left Join SNAP_WC_Daily.dbo.form_field T04 
+On T03.id = T04.form_id 
+Left Join SNAP_WC_Daily.dbo.uiform_field T05 
+On T04.field_template_id = T05.field_template_id 
+Left Join SNAP_WC_Daily.dbo.agency T06 
+On T06.id = T02.agency_id 
+Where DateAdd(day, 1, T02.effective_date) >= concat(year(getdate())-6,'-01-01')
+And T01.current_node_name = 'bound' 
+And T04.name = 'operatingRatioPercentage' 
+Order By T02.effective_date, SubmissionNumber, ProposalNumber         
+")
+
+RawDeductiblePolicies <- sqlQuery(myconn ,"
+Select 
+DateAdd(day, 1, T02.effective_date) As EffectiveDate, 
+T02.submission_number As SubmissionNumber, 
+T06.agency_number, 
+T01.ordinal_number As ProposalNumber, 
+T01.current_node_name As Status, 
+T01.total_premium As QuotedPremium, 
+O.name As BranchName, 
+P.first_name + ' ' + P.last_name As ResponsibleUW, 
+T03.name As FormSectionName, 
+T04.name As FormFieldName, 
+T04.value As FormFieldValue 
+From SNAP_WC_Daily.dbo.quote T01 
+Left Join SNAP_WC_Daily.dbo.submission T02 
+On T01.submission_id = T02.id 
+Left Join SNAP_WC_Daily.dbo.person P 
+On T02.responsible_underwriter_id = P.id 
+Left Join SNAP_WC_Daily.dbo.organization O 
+On T02.carrier_branch_id = O.id 
+Left Join SNAP_WC_Daily.dbo.form T03 
+On T01.form_set_id = T03.owner_id 
+Left Join SNAP_WC_Daily.dbo.form_field T04 
+On T03.id = T04.form_id 
+Left Join SNAP_WC_Daily.dbo.uiform_field T05 
+On T04.field_template_id = T05.field_template_id 
+Left Join SNAP_WC_Daily.dbo.agency T06 
+On T06.id = T02.agency_id 
+Where DateAdd(day, 1, T02.effective_date) >= concat(year(getdate())-6,'-01-01')
+And T01.current_node_name = 'bound' 
+And T04.name = 'policyType' 
+And T04.value Like '%Deductible%' 
+Order By T02.effective_date, SubmissionNumber, ProposalNumber                                  
+")
+
+close(myconn)
+
+RawOperatingInformation <- as_tibble(RawOperatingInformation)
+RawDeductiblePolicies <- as_tibble(RawDeductiblePolicies) %>%
+  mutate(SubmissionNumber = as.numeric(SubmissionNumber))
+
+OperatingInformation <- RawOperatingInformation %>%
+  mutate(FormFieldValue = FormFieldValue * .01)
+
+## Round function in R rounds values at .5 down rather than up
+## round2 fixes this
+round2 <- function(x, n = 0) {
+  posneg = sign(x)
+  z = abs(x)*10^n
+  z = z + 0.5
+  z = trunc(z)
+  z = z/10^n
+  z*posneg
+}
+
+BoundDeductiblePolicies <- inner_join(OperatingInformation ,RawDeductiblePolicies ,by = c("SubmissionNumber") ,suffix = c("" ,"_ded")) %>%
+  rename(oi_percent        = FormFieldName
+         ,oi_percent_value = FormFieldValue
+         ,deductible       = FormFieldName_ded
+         ,deductible_value = FormFieldValue_ded
+  ) %>%
+  select(-contains("_ded")) %>%
+  mutate(new_oi_value = round2(QuotedPremium * oi_percent_value ,n = 0))
+
+#####################################################################################
+## OI Override --Large Deductible Override
+#####################################################################################
+
+SubmissionsWithDeductibleOiOverride <- left_join(SubmissionsWithProfitAgencyAndTargetOi ,BoundDeductiblePolicies ,by = c("Quote_ID" = "SubmissionNumber") ,suffix = c("" ,"_ded")) %>%
+  select(-contains("_ded") ,-contains("deductible") ,-c(EffectiveDate ,agency_number ,ProposalNumber ,Status ,BranchName ,ResponsibleUW ,FormSectionName ,oi_percent ,oi_percent_value)) %>%
+  mutate(oi = coalesce(new_oi_value ,oi)) %>%
+  select(-new_oi_value)
+
+#####################################################################################
+## OI Override --Manual Override
+#####################################################################################
+
+ManualOiOverrides <- read_xlsx("//DC1CFS01/Company/Ent Strategy and Analytics/PFP/Reports/Dashboard/PFP Overrides.xlsx" ,sheet = "OI Overrides")
+
+SubmissionsWithManualOiOverride <- SubmissionsWithDeductibleOiOverride %>%
+  left_join(ManualOiOverrides ,by = c("Quote_ID" = "Submission_ID")) %>%
+  mutate(oi         = round2(coalesce(`New OI Value` ,oi) ,n = 0)) %>%
+  mutate_at(vars(quoted_oi ,bound_profit ,quoted_profit) ,round2 ,n = 0) %>%
+  mutate_at(vars(DateEffective ,DateExpiration ,sent_date) ,floor_date ,unit = "day") %>%
+  mutate_at(vars(DateEffective ,DateExpiration ,sent_date) ,as.Date) %>%
+  mutate_at(vars(DateEffective ,DateExpiration ,sent_date) ,force_tz ,tzone = "GMT") %>%
+  select(-c(`New OI Value` ,Reason)) %>%
+  select(contains("Branch") ,BDU_ID ,UA_ID ,Quote_ID ,proposal_number ,contains("UWName_") ,contains("DateE") ,contains("status") ,everything()) %>%
+  select(Branch_ID:status_reason ,QuoteCount ,BoundCount ,BoundPremium ,BrokerNumber ,renewal_flag ,policy_number ,everything()) %>%
+  select(Branch_ID:policy_number ,Name_Insured ,oi ,Combined_Ratio ,Operating_Income_Ratio ,QuotedPremium ,quoted_oi ,everything()) %>%
+  select(Branch_ID:quoted_oi ,Producer ,contains("profit") ,IQ_Type ,AU_ID ,contains("Governing") ,StateCount ,sent_date) %>%
+  arrange(Quote_ID)
+
+#####################################################################################
+## BDUs and UAs --New Section
+#####################################################################################
+
+myconn <- odbcConnect("BI_PFP")
+
+RawEmployeeInformation <- sqlQuery(myconn ,"
+Select * From dbo.Employee_Master         
+")
+
+close(myconn)
+
+RawEmployeeInformation <- as_tibble(RawEmployeeInformation) %>%
+  select(Emp_ID ,contains("t_Name"))
+
+SubmissionsWithUwAssignments <- SubmissionsWithManualOiOverride %>%
+  left_join(RawEmployeeInformation ,by = c("BDU_ID" = "Emp_ID") ,suffix = c("" ,"_bdu")) %>%
+  left_join(RawEmployeeInformation ,by = c("UA_ID" = "Emp_ID") ,suffix = c("" ,"_ua")) %>%
+  left_join(RawEmployeeInformation ,by = c("AU_ID" = "Emp_ID") ,suffix = c("" ,"_au")) %>%
+  select(-c(BDU_ID ,UA_ID ,AU_ID)) %>%
+  mutate(bdu = str_c(First_Name ," " ,Last_Name)
+         ,ua = str_c(First_Name_ua ," " ,Last_Name_ua)
+         ,au = str_c(First_Name_au ," " ,Last_Name_au)) %>%
+  select(-contains("t_Name")) %>%
+  rename(branch       = Branch_Desc
+         ,agency_code = BrokerNumber) %>%
+  mutate_if(is.factor ,as.character)
+
+#####################################################################################
+## Hubs and Regions --New Section
+#####################################################################################
+
+myconn <- odbcConnect("BI_PFP")
+
+RawRegionInformation <- sqlQuery(myconn ,"
+Select * From dbo.Organization         
+")
+
+close(myconn)
+
+RegionInformation <- as_tibble(RawRegionInformation) %>%
+  mutate_if(is.factor ,as.character) %>%
+  mutate_at(vars(Effective_Start ,Effective_End) ,floor_date ,unit = "day") %>%
+  # mutate_at(vars(Effective_Start ,Effective_End) ,force_tz ,tzone = "GMT") %>%
+  mutate_at(vars(Effective_Start ,Effective_End) ,as.Date) %>%
+  mutate(Effective_Start = if_else(year(Effective_Start) < 2016 ,ymd(19901231) ,if_else((ID == 27 & Effective_Start < ymd(20180302)) ,ymd(20180201) ,Effective_Start))
+         ,Effective_End  = coalesce(Effective_End ,ymd(20991231))) %>%
+  select(-c(ID ,Branch_ID ,KP_Region))
+
+SubmissionsWithRegions <- SubmissionsWithUwAssignments %>%
+  inner_join(RegionInformation ,by = c("branch" = "Territory")) %>%
+  filter(Effective_Start <= DateEffective & DateEffective <= Effective_End) %>%
+  mutate(EffectivePeriod     = floor_date(DateEffective ,unit = "month")
+         ,report_period_year = year(EffectivePeriod)
+         ,report_period_half = if_else(month(EffectivePeriod) >= 7 ,"H2" ,"H1")
+         ,report_period      = str_c(report_period_year ,"_" ,report_period_half)) %>%
+  select(-c(report_period_year ,report_period_half ,Branch_ID ,Effective_Start ,Effective_End))
+
+#####################################################################################
+## Cancels --New Section
+#####################################################################################
+
+SubmissionsNotCancelled <- SubmissionsWithRegions %>%
+  filter(submissionstatus != "cancelled")
+
+SubmissionsCancelled <- SubmissionsWithRegions %>%
+  filter(submissionstatus == "cancelled") %>%
+  mutate(policy_days = interval(DateEffective ,DateExpiration) %/% days(1))
+
+SubmissionsNotRewritten <- SubmissionsCancelled %>%
+  filter(!(str_detect(tolower(status_reason) ,pattern = "rewritten")) | is.na(status_reason))
+
+## Use for TRIA section
+SubmissionsRewritten <- SubmissionsCancelled %>%
+  filter(str_detect(tolower(status_reason) ,pattern = "rewritten")) %>%
+  filter(policy_days > 15) %>%
+  mutate(oi            = oi * policy_days / 365
+         ,BoundPremium = BoundPremium * policy_days / 365
+         ,bound_profit = bound_profit * policy_days / 365)
+
+SubmissionsNotRewrittenShortPolicies <- SubmissionsNotRewritten %>%
+  filter(policy_days <= 15) %>%
+  mutate(oi             = 0
+         ,BoundCount    = 0
+         ,BoundPremium  = 0
+         ,QuotedPremium = 0
+         ,quoted_oi     = 0
+         ,bound_profit  = 0)
+
+SubmissionsNotRewrittenLongerPolicies <- SubmissionsNotRewritten %>%
+  filter(policy_days > 15)
+
+SubmissionsFilteredCancels <- bind_rows(SubmissionsNotRewrittenLongerPolicies ,SubmissionsNotRewrittenShortPolicies ,SubmissionsRewritten) %>%
+  select(-policy_days) %>%
+  bind_rows(SubmissionsNotCancelled) %>%
+  filter(!(tolower(UWName_Last) %in% c("locksy" ,"reznicek") | agency_code %in% c(99999 ,9990 ,9991 ,99998))) %>%
+  mutate(Type           = if_else(BoundCount == 1 ,"Issued" ,if_else(QuoteCount == 1 ,"Quoted Not Bound" ,"Not Quoted"))
+         ,QuotedPremium = if_else(BoundPremium > 0 ,0 ,QuotedPremium)
+         ,quoted_oi     = if_else(BoundPremium > 0 ,0 ,quoted_oi))
+
+#####################################################################################
+## TRIA --New Section
+#####################################################################################
+
+myconn <- odbcConnect("BI_XLDP")
+
+RawTriaData <- sqlQuery(myconn ,"
+Select 
+d.CalendarDate, 
+a.*,
+P.EAPExcludingTRIATotalAmt EAPxTRIA, 
+P.TotalEAPTotalAmt As 'Total EAP Total Amt', 
+P.TotalEAPTotalAmt - P.EAPExcludingTRIATotalAmt As 'Implied TRIA per XLDP' 
+From XLDPWarehouse.dbo.dimApplication a 
+Left Join XLDPWarehouse.dbo.dimDate d 
+On a.ProspectivePolicyEffectiveDateDimId = d.ObjectId 
+Left Join XLDPWarehouse.dbo.fctXLDPModelPremium P 
+On a.WarehouseId = P.ApplicationDimId 
+Where Year(d.CalendarDate) >= Year(GetDate()) - 6 
+And a.AccountId Is Not Null 
+And a.ProposalNumber Is Not Null 
+And a.AgentName Not In ('WC Test Agency') 
+And a.AgentName Not In ('ICW Systems Test')         
+")
+
+close(myconn)
+
+RawTriaData <- as_tibble(RawTriaData)
+
+TriaFilteredProposals <- inner_join(RawTriaData ,FinalSubmissions ,by = c("AccountId" = "Quote_ID" ,"ProposalNumber" = "proposal_number")) %>%
+  select(-c(id ,Name_Insured ,UWName_First ,UWName_Last ,Producer ,DateEffective ,DateExpiration ,status_reason)) %>%
+  select(-c(QuoteCount ,BoundCount ,BrokerNumber ,`Renewal Flag` ,policy_number ,FormFieldValue ,Quoted_OI ,IQ_Type))
+
+TriaMaxCreated <- TriaFilteredProposals %>%
+  group_by(AccountId ,ProposalNumber) %>%
+  summarise(max_created_date = max(CreatedDt))
+
+TriaLatest <- inner_join(TriaFilteredProposals ,TriaMaxCreated ,by = c("AccountId" ,"ProposalNumber" ,"CreatedDt" = "max_created_date")) %>%
+  select(effective_date = CalendarDate ,WarehouseId ,AccountId ,ProposalNumber ,BranchName ,ApplicantName ,PolicyStatusDimId ,EAPxTRIA ,`Total EAP Total Amt` ,implied_tria_per_xldp = `Implied TRIA per XLDP`)
+
+TriaLatestNotRewritten <- anti_join(TriaLatest ,SubmissionsRewritten ,by = c("AccountId" = "Quote_ID" ,"ProposalNumber" = "proposal_number")) %>%
+  select(effective_date ,WarehouseId ,ProposalNumber ,AccountId ,BranchName:implied_tria_per_xldp)
+
+TriaLatestRewritten <- inner_join(SubmissionsRewritten ,TriaLatest ,by = c("Quote_ID" = "AccountId" ,"proposal_number" = "ProposalNumber")) %>%
+  select(au ,GoverningState ,GoverningClass ,StateCount ,sent_date ,policy_days ,effective_date ,WarehouseId ,ProposalNumber = proposal_number ,AccountId = Quote_ID ,BranchName:implied_tria_per_xldp) %>%
+  mutate(implied_tria_per_xldp = implied_tria_per_xldp * policy_days / 365) %>%
+  select(-policy_days)
+
+FinalTria <- bind_rows(TriaLatestRewritten ,TriaLatestNotRewritten) %>%
+  select(AccountId ,ProposalNumber ,tria = implied_tria_per_xldp)
+
+#####################################################################################
+## Organizing Data --New Section
+#####################################################################################
+
+SubmissionsWithTriaInfo <- left_join(SubmissionsFilteredCancels ,FinalTria ,by = c("Quote_ID" = "AccountId" ,"proposal_number" = "ProposalNumber") ,suffix = c("" ,"_remove")) %>%
+  mutate(BoundPremium              = round2(BoundPremium)
+         ,oi                       = round2(oi)
+         ,bound_profit             = round2(bound_profit)
+         ,tria                     = coalesce(tria ,0)
+         ,tria                     = if_else((BoundPremium == 0 & is.na(QuotedPremium)) ,0 ,tria)
+         ,bound_premium_excl_tria  = if_else(BoundPremium == 0 ,0 ,round2(BoundPremium - tria))
+         ,quoted_premium_excl_tria = if_else(coalesce(QuotedPremium ,0) == 0 ,0 ,round2(QuotedPremium) - tria))
+
+## Final steps ... think you shouldn't necessarily keep the mutates
+## Should also keep the proposal number field
+## Can just use SubmissionsWithTriaInfo
+FinalAlteryxData <- SubmissionsWithTriaInfo %>%
+  mutate(BoundPremium   = if_else(year(EffectivePeriod) <= 2018 ,BoundPremium ,bound_premium_excl_tria)
+         ,QuotedPremium = quoted_premium_excl_tria) %>%
+  mutate_at(vars(BoundPremium ,oi ,bound_profit) ,round2) %>%
+  select(-c(tria ,bound_premium_excl_tria ,quoted_premium_excl_tria)) %>%
+  select(agency_code ,Quote_ID ,bdu ,ua ,UWName_First ,UWName_Last ,renewal_flag ,DateEffective ,submissionstatus ,everything()) %>%
+  select(agency_code:submissionstatus ,QuoteCount ,BoundCount ,BoundPremium ,oi ,policy_number ,IQ_Type ,branch ,Hub ,everything()) %>%
+  select(agency_code:Hub ,Region ,LOB ,EffectivePeriod ,report_period ,DateExpiration ,status_reason ,Name_Insured ,everything()) %>%
+  select(agency_code:Name_Insured ,Combined_Ratio:quoted_profit ,au ,GoverningState ,GoverningClass ,StateCount ,everything()) %>%
+  select(agency_code:StateCount ,sent_date ,Type) %>%
+  arrange(Quote_ID)
