@@ -1,5 +1,7 @@
 %2F%2Fnewfs5%2FEXCEL%2FACTUARIA%2FACTUARIAL%2FSubmissionDataset%2FCode%2FSubmission%20Dataset.R="87E7E26C"
 %2F%2Fnewfs5%2FEXCEL%2FACTUARIA%2FACTUARIAL%2FSubmissionDataset%2FCode%2FgetSubmissionsWithTriaInfo.R="8EFBB7B5"
+%2F%2Fnewfs5%2FEXCEL%2FACTUARIA%2FWCDEV%2FLDP_Redesign%2FAnalysis%2FData%20Cuts%2FData%20Cuts.R="36C50176"
+%2F%2Fnewfs5%2FEXCEL%2FACTUARIA%2FWCDEV%2FLDP_Redesign%2FCode%20Samples%2FPricing%20Templates%2FComparison%20File%20Mockup%2FComparison%20File%20Generation.R="06E8993C"
 %2F%2Fnewfs5%2FEXCEL%2FACTUARIA%2FWCDEV%2FLDP_Redesign%2FCode%20Samples%2FR%2FActuarialFunctions%2FDESCRIPTION="0A360E0D"
 %2F%2Fnewfs5%2FEXCEL%2FACTUARIA%2FWCDEV%2FLDP_Redesign%2FCode%20Samples%2FR%2FActuarialFunctions%2FR%2FDateFunctions.R="88E78670"
 %2F%2Fnewfs5%2FEXCEL%2FACTUARIA%2FWCDEV%2FLDP_Redesign%2FCode%20Samples%2FR%2FActuarialFunctions%2Fman%2FInforceDateRange.Rd="751E78CA"
@@ -7,4 +9,5 @@
 ~%2FActuarialDateFunctions%2FR%2Fhello.R="5670648B"
 ~%2FR%2FActuarialFunctions%2FDESCRIPTION="73957ECE"
 ~%2FR%2FActuarialFunctions%2FR%2FDateFunctions.R="7668C4E1"
+~%2FR%2FActuarialFunctions%2FR%2FXldpFunctions.R="B8F19AF0"
 ~%2FR%2FActuarialFunctions%2Fman%2FinforceCheck.Rd="171909D6"
