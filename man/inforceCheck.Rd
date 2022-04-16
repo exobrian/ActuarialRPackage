@@ -7,11 +7,11 @@
 inforceCheck(EffectiveDate, ExpirationDate, EvaluationDate = Sys.Date())
 }
 \arguments{
-\item{EffectiveDate}{Effective Date of policy.}
+\item{EffectiveDate}{Date type: Effective Date of policy.}
 
-\item{ExpirationDate}{Expiration Date of policy.}
+\item{ExpirationDate}{Date type: Expiration Date of policy.}
 
-\item{EvaluationDate}{Date of the evaluation (this will be the date of reference or checking. Default is current date).}
+\item{EvaluationDate}{Date type: Date of the evaluation (this will be the date of reference or checking. Default is current date).}
 }
 \value{
 Bool indicating whether the policy is inforce at the time of evaluation.
