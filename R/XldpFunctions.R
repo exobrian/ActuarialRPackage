@@ -1,11 +1,3 @@
-
-
-
-
-
-
-
-
 #' @title Get Submission Master Table Data
 #'
 #' @description Submissions Master Table is updated every month by Brian Tran.
@@ -34,7 +26,7 @@ getSubmissionMasterTable <- function(){
      From ActuarialPlayPantry.rrr.SubmissionMaster_WithDevelopedClaims
 
      where warehouseid is not null
-     and submissionstatus = 'issued'
+     --and submissionstatus = 'issued'
      and PolicyEffectiveDate >= Dateadd(year,-1,getdate()-1)
        ")
   close(submissionsConn)
