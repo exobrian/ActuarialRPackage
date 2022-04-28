@@ -3,14 +3,15 @@
 
 library(zipcodeR)
 library(tidyverse)
+library(RODBC)
 
 uploadDate = Sys.time()
 
 #ICW Main States: Add more as needed
-stateList <- c("CA", "FL", "GA", "IA", "IL", 
-               "IN", "KY", "MD", "MI", "MN", 
-               "MO", "NC", "NJ", "NV", "NY", 
-               "OK", "PA", "SC", "TN", "TX", 
+stateList <- c("CA", "FL", "GA", "IA", "IL",
+               "IN", "KY", "MD", "MI", "MN",
+               "MO", "NC", "NJ", "NV", "NY",
+               "OK", "PA", "SC", "TN", "TX",
                "VA", "WI")
 
 #Initiate an empty dataframe
@@ -20,7 +21,7 @@ i = 1
 #pull specific columns from zipcodeR for each zipcode in stateList
 for (st in stateList){
   CityInfo <- data.frame(rep(uploadDate), search_state(stateList[i])[c("zipcode", "major_city", "county", "state","population")])
-  df <- rbind(df, CityInfo) 
+  df <- rbind(df, CityInfo)
   i = i + 1
 }
 
@@ -54,8 +55,8 @@ if (dbExistsTable(myconn, TableName)){
 }
 
 #Renaming to a more friendly name.
-names(df2) <- c("UploadDate", "Zipcode", 
-                "MajorCity", "County", 
+names(df2) <- c("UploadDate", "Zipcode",
+                "MajorCity", "County",
                 "State", "StateCode",
                 "CountyCode", "FipsCode",
                 "Population")
