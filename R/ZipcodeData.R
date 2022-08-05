@@ -52,7 +52,10 @@ TableName <- DBI::Id(table  = "ZipcodeData")
 #it has to do with the identity constraint on id. We probably don't need versioning anyways, so
 #creating table is good enough for now.
 if (dbExistsTable(myconn, TableName)){
-  dbRemoveTable(myconn ,TableName)
+  #dbRemoveTable(myconn ,TableName)
+
+  # no permission to drop a table. delete all records from this table?
+  dbExecute(myconn, paste("DELETE FROM", "ZipcodeData"))
 }
 
 #Renaming to a more friendly name.

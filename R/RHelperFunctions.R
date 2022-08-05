@@ -29,3 +29,26 @@ right <- function (string, char) {
 left <- function (string,char) {
   substr(string,1,char)
 }
+
+#' latestFile Function
+#'
+#' @description This function returns the latest file name (including extension) matching the wildcard given in the path specified
+#' @param filePath File path to search in. Note: this is not recursive.
+#' @param fileName Wildcard of file searching for.
+#'
+#' @return
+#' @export
+#'
+#' @examples
+#' latestFile("C://", "Hello")
+latestFile <- function(filePath, fileName) {
+  if(!dir.exists(stateFilePath)) {
+    print(str_c("The Path '", filePath, "' does not exist. Please check and try again."))
+    exit()
+  }
+  pattern = paste("*", fileName, "*", sep="", collapse="")
+  tempFileList <- file.info(list.files(filePath
+                                       ,pattern = pattern
+                                       ,full.names=T))
+  basename(rownames(tempFileList[which.max(tempFileList$mtime),]))
+}
