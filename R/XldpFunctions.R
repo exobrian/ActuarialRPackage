@@ -1,3 +1,6 @@
+#Tidyverse is required.
+if (!require("tidyverse")){install.packages("tidyverse")}
+
 #' @title Get Submission Master Table Data
 #'
 #' @description Submissions Master Table is updated every month by Brian Tran.
@@ -58,7 +61,7 @@ createLabels <- function (breaksVector, commas = TRUE, decimalPlaces = 2) {
 #' To Bands Function
 #'
 #' @description This function will cut the data and categorize using labels.
-#' @param column Vector of data to be cut
+#' @param column Numeric list of values to cut. Ex: as.numeric(unlist(data[column]))
 #' @param sequenceVector Vector of values to create the segments on. Note: If Inf is not set to upper bound, this will set Inf as the upper bound by default.
 #' @param commas
 #' @param decimalPlaces How many decimals to use for cutting and labels
@@ -77,9 +80,7 @@ toBands <- function (column, sequenceVector, commas = TRUE, decimalPlaces=2, ove
   }
   bandBreaks <- sequenceVector
   bandLabels <- createLabels(bandBreaks, decimalPlaces = decimalPlaces)
-  dataBand <- cut(as.numeric(column), breaks = bandBreaks, labels = bandLabels, right = FALSE)
-  dataBand <- addNA(dataBand)
-  levels(dataBand)[is.na(levels(dataBand))] <- unknown
+  dataBand <- cut(column, breaks = bandBreaks, labels = bandLabels, right = FALSE)
   return(dataBand)
 }
 
