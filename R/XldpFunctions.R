@@ -66,13 +66,15 @@ createLabels <- function (breaksVector, commas = TRUE, decimalPlaces = 2) {
 #' @param commas
 #' @param decimalPlaces How many decimals to use for cutting and labels
 #' @param overrideLeft If this is on, function will set left boundary to be -Inf or 0 depending on if the first value is < 0 or not respectively.
+#' @param overrideRight If this is on, function will set Right boundary to be Inf
 #'
 #' @return Vector of characters.
 #'
 #' @examples toBands(c(0.1, 0.12, 0.25, 0.33, 0.75, 1.25), sequenceVector = c(0, 0.2, 0.30, 0.40), decimalPlaces=2, overrideLeft = FALSE)
-toBands <- function (column, sequenceVector, commas = TRUE, decimalPlaces=2, overrideLeft = FALSE, unknown="Unknown") {
-  #If the user desires an override, we'll set it to negative Infinity or zero depending on what the left most entry is.
-  if (tail(sequenceVector, n=1) != Inf) {
+toBands <- function (column, sequenceVector, commas = TRUE, decimalPlaces=2, overrideLeft=FALSE, overrideRight=FALSE, unknown="Unknown", right=FALSE) {
+  #If the user desires an override, we'll set the left boundary to negative Infinity or zero depending on what the left most entry is.
+  #Similarly, the right will be overridden to Inf.
+  if (tail(sequenceVector, n=1) != Inf && overrideRight) {
     sequenceVector <- append(sequenceVector, Inf)
   }
   if (overrideLeft) {
@@ -80,7 +82,7 @@ toBands <- function (column, sequenceVector, commas = TRUE, decimalPlaces=2, ove
   }
   bandBreaks <- sequenceVector
   bandLabels <- createLabels(bandBreaks, decimalPlaces = decimalPlaces)
-  dataBand <- cut(column, breaks = bandBreaks, labels = bandLabels, right = FALSE)
+  dataBand <- cut(column, breaks = bandBreaks, labels = bandLabels, right = right)
   return(dataBand)
 }
 
