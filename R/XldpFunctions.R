@@ -67,7 +67,7 @@ createLabels <- function (breaksVector, commas = TRUE, decimalPlaces = 2) {
 #' @return Vector of characters.
 #'
 #' @examples toBands(c(0.1, 0.12, 0.25, 0.33, 0.75, 1.25), sequenceVector = c(0, 0.2, 0.30, 0.40), decimalPlaces=2, overrideLeft = FALSE)
-toBands <- function (column, sequenceVector, commas = TRUE, decimalPlaces=2, overrideLeft = FALSE) {
+toBands <- function (column, sequenceVector, commas = TRUE, decimalPlaces=2, overrideLeft = FALSE, unknown="Unknown") {
   #If the user desires an override, we'll set it to negative Infinity or zero depending on what the left most entry is.
   if (tail(sequenceVector, n=1) != Inf) {
     sequenceVector <- append(sequenceVector, Inf)
@@ -77,7 +77,9 @@ toBands <- function (column, sequenceVector, commas = TRUE, decimalPlaces=2, ove
   }
   bandBreaks <- sequenceVector
   bandLabels <- createLabels(bandBreaks, decimalPlaces = decimalPlaces)
-  dataBand = cut(as.numeric(column), breaks = bandBreaks, labels = bandLabels, right = FALSE)
+  dataBand <- cut(as.numeric(column), breaks = bandBreaks, labels = bandLabels, right = FALSE)
+  dataBand <- addNA(dataBand)
+  levels(dataBand)[is.na(levels(dataBand))] <- unknown
   return(dataBand)
 }
 

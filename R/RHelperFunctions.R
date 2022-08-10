@@ -42,7 +42,7 @@ left <- function (string,char) {
 #' @examples
 #' latestFile("C://", "Hello")
 latestFile <- function(filePath, fileName) {
-  if(!dir.exists(stateFilePath)) {
+  if(!dir.exists(filePath)) {
     print(str_c("The Path '", filePath, "' does not exist. Please check and try again."))
     exit()
   }
